@@ -183,6 +183,7 @@ static int msdosfs_entry_setup_filenames(struct archive_write *,
 	msdosfs_entry_t *, struct archive_entry *);
 static int msdosfs_entry_setup_filenames(struct archive_write *,
 	msdosfs_entry_t *, struct archive_entry *);
+static struct msdosfs_entry *msdosfs_entry_find_child(struct msdosfs_entry *parent, const char *child_name);
 static int msdosfs_entry_tree_add(struct archive_write *, struct msdosfs_entry **);
 static int msdosfs_entry_new(struct archive_write *a, struct archive_entry *entry,
     msdosfs_entry_t **m_entry);
@@ -454,7 +455,6 @@ static int
 msdosfs_options(struct archive_write *a, const char *key, const char *value)
 {
 	msdosfs_ctx_t *ctx;
-	const char *p;
 	int r;
 
 	ctx = a->format_data;
@@ -489,11 +489,6 @@ msdosfs_options(struct archive_write *a, const char *key, const char *value)
 	 * a suitable error if no one used this option.
 	 */
 	return (ARCHIVE_WARN);
-
-invalid_value:
-	archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-	    "Invalid value for option ``%s''", key);
-	return (ARCHIVE_FAILED);
 }
 
 static int
