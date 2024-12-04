@@ -39,6 +39,7 @@
 #endif
 #include <stdio.h>
 #include <stdarg.h>
+#include <strings.h>
 #ifdef HAVE_STDLIB_H
 #include <stdlib.h>
 #endif
@@ -1471,7 +1472,6 @@ write_bpb(struct archive_write *a)
 
 static void print_tree(struct archive_rb_tree *root);
 
-static int flcnt = 0;
 
 static int
 msdosfs_close(struct archive_write *a)
@@ -1583,6 +1583,7 @@ msdosfs_close(struct archive_write *a)
 		}
 
 		// Write short name entry
+		uint8_t name[11];
 		memcpy(name, file->short_name, 11);
 		printf("DIRE %s\n", name);
 		__archive_write_output(a, name, 11);
@@ -1612,8 +1613,9 @@ msdosfs_close(struct archive_write *a)
 		__archive_write_output(a, &clstw, 2);
 		if (file->filetype != AE_IFDIR) {
 			archive_le32enc(&z, file->size);
-		else
+		} else {
 			z = 0;
+		}
 		__archive_write_output(a, &z, 4);
 		file = file->next;
 	}
