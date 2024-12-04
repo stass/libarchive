@@ -1074,6 +1074,12 @@ msdosfs_entry_new(struct archive_write *a, struct archive_entry *entry,
 		msdosfs_entry_cmp_node, msdosfs_entry_cmp_key
 	};
 
+	if (archive_entry_pathname(entry) == NULL) {
+		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+		    "Invalid entry - no pathname");
+		return (ARCHIVE_FAILED);
+	}
+
 	me = calloc(1, sizeof(*me));
 	if (me == NULL) {
 		archive_set_error(&a->archive, ENOMEM,
@@ -1083,6 +1089,21 @@ msdosfs_entry_new(struct archive_write *a, struct archive_entry *entry,
 	}
 
 	r = msdosfs_entry_setup_filenames(a, me, entry);
+	if (r < ARCHIVE_WARN) {
+		msdosfs_entry_free(me);
+		*m_entry = NULL;
+		return (r);
+	}
+
+	// Generate short name and LFN entries
+	r = generate_short_name(me, me->parent);
+	if (r < ARCHIVE_WARN) {
+		msdosfs_entry_free(me);
+		*m_entry = NULL;
+		return (r);
+	}
+
+	r = generate_lfn_entries(me);
 	if (r < ARCHIVE_WARN) {
 		msdosfs_entry_free(me);
 		*m_entry = NULL;
@@ -1549,25 +1570,38 @@ msdosfs_close(struct archive_write *a)
 	struct msdosfs_entry *file;
 	file = ctx->file_list.first;
 	while (file != NULL) {
-		char name[12];
 		uint8_t attr;
 		uint32_t z = 0;
 		uint16_t clstw;
-		
-		snprintf(name, 12, "FL%-6dTXT", flcnt++);
+		uint16_t time, date;
+
+		// Write LFN entries if needed
+		if (file->lfn_entries > 0) {
+			// TODO: Implement LFN entry writing
+		}
+
+		// Write short name entry
+		memcpy(name, file->short_name, 11);
 		printf("DIRE %s\n", name);
 		__archive_write_output(a, name, 11);
-		if (file->filetype != AE_IFDIR) {
-			attr = 0x0;
-		} else {
-			attr = 0x1;
-		}
+
+		// Set proper attributes
+		attr = 0;
+		if (file->filetype == AE_IFDIR)
+			attr |= 0x10;  // Directory
+		if (file->basename.s[0] == '.')
+			attr |= 0x02;  // Hidden
+		if (!(file->mode & 0200))
+			attr |= 0x01;  // Read-only
 		__archive_write_output(a, &attr, 1);
-		__archive_write_output(a, &z, 1);
-		__archive_write_output(a, &z, 1);
-		__archive_write_output(a, &z, 2);
-		__archive_write_output(a, &z, 2);
-		__archive_write_output(a, &z, 2);
+		__archive_write_output(a, &z, 1); // Reserved
+		
+		// Write creation time/date
+		time = fat_time(file->mtime);
+		date = fat_date(file->mtime);
+		__archive_write_output(a, &time, 2);
+		__archive_write_output(a, &date, 2);
+		__archive_write_output(a, &date, 2); // Last access date
 		archive_le16enc(&clstw, file->cluster >> 16);
 		__archive_write_output(a, &clstw, 2);
 		__archive_write_output(a, &z, 2);
