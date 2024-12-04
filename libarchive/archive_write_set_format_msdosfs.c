@@ -470,6 +470,8 @@ msdosfs_options(struct archive_write *a, const char *key, const char *value)
 		return get_str_opt(a, &ctx->volume_label, 11, key, value);
 	}
 	if (strcmp(key, "oem-name") == 0) {
+		return get_str_opt(a, &ctx->oem_name, 8, key, value);
+	}
 	if (strcmp(key, "sector-size") == 0) {
 		int num = 0;
 		r = get_num_opt(a, &num, 0xffff, 1, key, value);
