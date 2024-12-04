@@ -384,6 +384,71 @@ get_num_opt(struct archive_write *a, int *num, int high, int low,
 	return (ARCHIVE_OK);
 }
 
+static uint16_t fat_date(time_t t) {
+	struct tm *tm = localtime(&t);
+	return ((tm->tm_year - 80) << 9) |
+		((tm->tm_mon + 1) << 5) |
+		tm->tm_mday;
+}
+
+static uint16_t fat_time(time_t t) {
+	struct tm *tm = localtime(&t);
+	return (tm->tm_hour << 11) |
+		(tm->tm_min << 5) |
+		(tm->tm_sec / 2);
+}
+
+static int generate_short_name(struct msdosfs_entry *entry, struct msdosfs_entry *parent) {
+	char base[9], ext[4];
+	int i, j;
+	const char *src = entry->basename.s;
+	int collision = 0;
+	
+	/* Initialize with spaces */
+	memset(base, ' ', 8);
+	memset(ext, ' ', 3);
+	base[8] = ext[3] = '\0';
+
+	/* Split into base and extension */
+	for (i = 0, j = 0; src[i] && i < 8 && src[i] != '.'; i++)
+		base[j++] = toupper(src[i]);
+	
+	if (src[i] == '.') {
+		i++;
+		for (j = 0; src[i] && j < 3; i++, j++)
+			ext[j] = toupper(src[i]);
+	}
+
+	/* Handle collisions by adding ~N */
+	while (collision < 999999) {
+		char tmp[9];
+		struct msdosfs_entry *existing;
+		
+		if (collision > 0)
+			snprintf(tmp, sizeof(tmp), "%.6s~%d", base, collision);
+		else
+			strncpy(tmp, base, 8);
+
+		/* Check if name exists in parent */
+		existing = msdosfs_entry_find_child(parent, tmp);
+		if (!existing) {
+			/* Found unique name */
+			memcpy(entry->short_name, tmp, 8);
+			memcpy(entry->short_name + 8, ext, 3);
+			return ARCHIVE_OK;
+		}
+		collision++;
+	}
+	
+	return ARCHIVE_WARN;
+}
+
+static int generate_lfn_entries(struct msdosfs_entry *entry) {
+	size_t len = strlen(entry->basename.s);
+	entry->lfn_entries = (len + 12) / 13;
+	return ARCHIVE_OK;
+}
+
 static int
 msdosfs_options(struct archive_write *a, const char *key, const char *value)
 {
@@ -394,12 +459,17 @@ msdosfs_options(struct archive_write *a, const char *key, const char *value)
 	ctx = a->format_data;
 	assert(ctx != NULL);
 
-	if (strcmp(key, "oem-name") == 0) {
-		r = get_str_opt(a, &(ctx->oem_name),
-			OEM_NAME_MAX, key, value);
-//		iso9660->opt.application_id = r == ARCHIVE_OK;
-		return (r);
+	if (strcmp(key, "cluster-size") == 0) {
+		int size;
+		r = get_num_opt(a, &size, 512, 65536, key, value);
+		if (r == ARCHIVE_OK)
+			ctx->cluster_size = size;
+		return r;
 	}
+	if (strcmp(key, "volume-label") == 0) {
+		return get_str_opt(a, &ctx->volume_label, 11, key, value);
+	}
+	if (strcmp(key, "oem-name") == 0) {
 	if (strcmp(key, "sector-size") == 0) {
 		int num = 0;
 		r = get_num_opt(a, &num, 0xffff, 1, key, value);
