@@ -103,6 +103,10 @@ typedef struct msdosfs_entry {
 	struct archive_string uname;
 	struct archive_string gname;
 	struct archive_string fflags_text;
+	
+	uint32_t parent_cluster;  /* Cluster number of parent directory */
+	uint8_t short_name[11];   /* 8.3 format name */
+	uint8_t lfn_entries;      /* Number of LFN entries needed */
 	unsigned int nlink;
 	mode_t filetype;
 	mode_t mode;
@@ -135,6 +139,8 @@ typedef struct msdosfs_ctx {
 	uint64_t bytes_remaining;
 	msdosfs_entry_t *cur_entry;
 	uint32_t cluster_size;
+	uint32_t next_free_cluster;
+	uint32_t free_cluster_count;
 
 	struct msdosfs_entry *root;
 	struct msdosfs_entry *cur_dirent;
