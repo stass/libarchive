@@ -10,7 +10,8 @@
  *   6) Actually writes the final disk image into the archive (not empty).
  *
  * NOTE:
- *   - We now implement single-level subdirectories if a file's path has one slash.
+ *   - We now implement multi-level subdirectories by splitting the entire path
+ *     into components and creating them recursively.
  *   - We do not assign volume labels or handle advanced geometry.
  *   - Adjust or further test as needed!
  */
@@ -77,10 +78,9 @@ struct fat_file {
     int is_root;               /* For FAT12/16 fixed root or FAT32 cluster #2 root */
     off_t content_offset;      /* Where the file’s data is buffered in temp_fd */
 
-    /* NEW FIELDS for subdir/child management: */
     struct fat_file *parent;        /* The directory that contains us, NULL if root-level. */
-    struct fat_file *children;      /* Linked list of sub-files (if is_dir=1). */
-    struct fat_file *sibling;       /* Sibling link within the parent's children. */
+    struct fat_file *children;      /* Not heavily used in this approach, but can be expanded. */
+    struct fat_file *sibling;       /* Also not heavily used here. */
 };
 
 /* For tracking used short names to ensure uniqueness. */
@@ -113,7 +113,6 @@ struct msdosfs {
     size_t write_buffer_size;
     size_t write_buffer_pos;
 
-    /* NEW: tracking used shortnames globally, so we can ensure uniqueness. */
     struct shortname_list *used_shortnames;
 };
 
@@ -190,8 +189,11 @@ static int  write_dir_entry(unsigned char *buffer, const char *name, struct fat_
 static int  write_long_name_entries(unsigned char *buffer, const char *long_name, const char *short_name);
 static int  count_dir_entries_for_file(struct fat_file *f);
 
-/* NEW: Routines for building single-level subdirs and ensuring unique shortnames */
-static struct fat_file* find_or_create_dir(struct msdosfs *msdos, const char *dirname);
+/* -- CHANGED to accept a parent argument so subdirs can be nested properly. */
+static struct fat_file* find_or_create_dir(struct msdosfs *msdos,
+                                           struct fat_file *parent,
+                                           const char *dirname);
+
 static void ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char short_name[12]);
 
 /* ------------------- PUBLIC ENTRY POINT ------------------- */
@@ -251,8 +253,6 @@ archive_write_set_format_msdosfs(struct archive *_a)
     return (ARCHIVE_OK);
 }
 
-/* ------------------- OPTIONS ------------------- */
-
 static int
 archive_write_msdosfs_options(struct archive_write *a, const char *key, const char *value)
 {
@@ -268,8 +268,6 @@ archive_write_msdosfs_options(struct archive_write *a, const char *key, const ch
         msdos->fat_type = t;
         return (ARCHIVE_OK);
     }
-
-    /* For example, parse volume_size=, label=, etc. if needed. */
 
     return (ARCHIVE_WARN);
 }
@@ -289,36 +287,49 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
     file->size  = (uint32_t)archive_entry_size(entry);
     file->is_dir = (archive_entry_filetype(entry) == AE_IFDIR);
 
-    /* NEW/MODIFIED: Attempt single-level subdir by splitting on last slash. */
+    /// FIX START: Replace the old single-slash logic with multi-level creation.
     {
         const char *pathname = archive_entry_pathname(entry);
         if (!pathname)
             pathname = "";
-        /* We only handle one slash for single-level. If more exist, you'll want to adapt. */
-        {
-            const char *slash = strrchr(pathname, '/');
-            if (slash && slash[1] != '\0') {
-                /* directory part: up to 'slash', file part: slash+1 */
-                size_t dlen = (size_t)(slash - pathname);
-                if (dlen > 0) {
-                    char *dirname = malloc(dlen + 1);
-                    memcpy(dirname, pathname, dlen);
-                    dirname[dlen] = '\0';
-                    /* find or create that directory: */
-                    struct fat_file *dirf = find_or_create_dir(msdos, dirname);
-                    free(dirname);
-                    file->parent = dirf; /* place this file in that subdir */
-                    file->long_name = strdup(slash+1);
-                } else {
-                    /* slash was at start, treat like root plus final name */
-                    file->long_name = strdup(slash+1);
-                }
-            } else {
-                /* no slash => root dir */
-                file->long_name = strdup(pathname);
-            }
+
+        /* Split the entire path on '/' into components.
+         * We'll create/find each directory in turn. */
+        char *pathdup = strdup(pathname);
+        if (!pathdup) {
+            archive_set_error(&a->archive, ENOMEM, "strdup failed");
+            free(file);
+            return (ARCHIVE_FATAL);
         }
+        struct fat_file *parent_dir = NULL; /* NULL => root */
+        char *token, *brkt;
+        token = strtok_r(pathdup, "/", &brkt);
+        char *last_component = NULL;
+
+        while (token) {
+            char *next = strtok_r(NULL, "/", &brkt);
+            if (next) {
+                /* This is an intermediate directory name.  Create/find it. */
+                parent_dir = find_or_create_dir(msdos, parent_dir, token);
+            } else {
+                /* Last component => file or final dir name. */
+                last_component = token;
+            }
+            token = next;
+        }
+
+        if (last_component) {
+            file->long_name = strdup(last_component);
+            file->parent = parent_dir; /* final file or dir is child of parent_dir */
+        } else {
+            /* Means the path had trailing slash or was empty => root or single dir? */
+            file->long_name = strdup(pathdup);
+            /* If entire path was slashless single name, parent_dir == NULL, so it ends up in root. */
+            file->parent = parent_dir;
+        }
+        free(pathdup);
     }
+    /// FIX END
 
     file->next = msdos->files;
     msdos->files = file;
@@ -370,16 +381,6 @@ archive_write_msdosfs_finish_entry(struct archive_write *a)
     return (ARCHIVE_OK);
 }
 
-/*
- * The big close:
- *  1) Adjust geometry for FAT12/16 if needed to accommodate all root entries
- *  2) For FAT32, create a root_dir entry if needed
- *  3) Write boot sector
- *  4) Write FATs
- *  5) Write root directory
- *  6) Write each file's cluster data
- *  7) Copy entire disk image to final archive
- */
 static int
 archive_write_msdosfs_close(struct archive_write *a)
 {
@@ -423,7 +424,6 @@ archive_write_msdosfs_close(struct archive_write *a)
                 msdos->files   = root_dir;
             }
         }
-        /* Count top-level items. */
         int num_entries = 2; /* "." and ".." */
         {
             struct fat_file *f;
@@ -434,7 +434,6 @@ archive_write_msdosfs_close(struct archive_write *a)
                 }
             }
         }
-        /* Each entry is 32 bytes. */
         size_t dir_bytes_needed = (size_t)num_entries * DIR_ENTRY_SIZE;
         root_dir->size = (uint32_t)dir_bytes_needed;
     }
@@ -500,7 +499,6 @@ archive_write_msdosfs_free(struct archive_write *a)
 {
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
     if (msdos) {
-        /* Free the shortname list. */
         {
             struct shortname_list *p = msdos->used_shortnames;
             while (p) {
@@ -509,7 +507,6 @@ archive_write_msdosfs_free(struct archive_write *a)
                 p = nx;
             }
         }
-        /* Free all files. */
         {
             struct fat_file *f = msdos->files;
             while (f) {
@@ -686,7 +683,7 @@ write_boot_sector(struct archive_write *a)
     archive_le16enc(&hdr->bpb.bpbRsvdSecCnt, msdos->reserved_sectors);
     hdr->bpb.bpbNumFATs = 2;
     archive_le16enc(&hdr->bpb.bpbRootEntCnt, msdos->root_entries);
-    
+
     if (msdos->volume_size < 65536) {
         archive_le16enc(&hdr->bpb.bpbTotSec16, (uint16_t)msdos->volume_size);
         archive_le32enc(&hdr->bpb.bpbTotSec32, 0);
@@ -704,7 +701,7 @@ write_boot_sector(struct archive_write *a)
         archive_le16enc(&hdr->bpb.bpbFATSz16, msdos->fat_size);
     } else {
         archive_le16enc(&hdr->bpb.bpbFATSz16, 0);
-        
+
         archive_le32enc(&hdr->bpb_fat32.bpbFATSz32, msdos->fat_size);
         archive_le16enc(&hdr->bpb_fat32.bpbExtFlags, 0);
         archive_le16enc(&hdr->bpb_fat32.bpbFSVer, 0);
@@ -977,19 +974,17 @@ write_root_dir(struct archive_write *a)
         {
             int estimate=2;
             struct fat_file *f;
-            for (f = msdos->files; f; f=f->next) {
+            for (f=msdos->files; f; f=f->next) {
                 if (f==root_dir) continue;
                 if (!f->parent) {
                     estimate += count_dir_entries_for_file(f);
                 }
             }
-            /* Make a dynamic array. */
             struct fat_file **list = calloc((size_t)estimate, sizeof(*list));
             if (!list) {
                 archive_set_error(&a->archive, ENOMEM, "No mem for root dir list");
                 return (ARCHIVE_FATAL);
             }
-            /* Insert "." + ".." first. */
             list[num_entries++] = root_dir; 
             list[num_entries++] = NULL;     
             {
@@ -1007,7 +1002,7 @@ write_root_dir(struct archive_write *a)
                 if (r!=ARCHIVE_OK) return r;
             }
         }
-        /* Then recursively write subdirectories that exist under root */
+        /* Then recursively write subdirectories under root */
         {
             struct fat_file *f;
             for (f = msdos->files; f; f=f->next) {
@@ -1038,7 +1033,7 @@ write_root_dir(struct archive_write *a)
                             if (rr!=ARCHIVE_OK) return rr;
                         }
                     } else {
-                        /* empty dir, still write minimal . ..? */
+                        /* empty dir */
                         struct fat_file **dummy = calloc(2, sizeof(*dummy));
                         dummy[0] = f;
                         dummy[1] = NULL;
@@ -1064,11 +1059,9 @@ write_root_dir(struct archive_write *a)
 
         struct fat_file *f;
         for (f=msdos->files; f; f=f->next) {
-            /* Only write items that have no parent => top-level, or is_root. */
             if (!f->is_root && f->parent != NULL) {
                 continue;
             }
-            /* We do the normal name -> short name, ensure unique, etc. */
             char short_name[12];
             make_short_name(f->long_name ? f->long_name : "", short_name);
             ensure_unique_short_name(a, msdos, short_name);
@@ -1090,24 +1083,20 @@ write_root_dir(struct archive_write *a)
             offset += write_dir_entry(buf+offset, short_name, f);
         }
 
-        /* Seek & write the entire fixed root region */
-        {
-            off_t root_off = (off_t)(msdos->root_offset)*SECTOR_SIZE;
-            if (lseek(msdos->temp_fd, root_off, SEEK_SET)<0 ||
-                write(msdos->temp_fd, buf, root_dir_bytes) != (ssize_t)root_dir_bytes) {
-                free(buf);
-                archive_set_error(&a->archive, errno, "FAT12/16 root write failed");
-                return (ARCHIVE_FATAL);
-            }
+        off_t root_off = (off_t)(msdos->root_offset)*SECTOR_SIZE;
+        if (lseek(msdos->temp_fd, root_off, SEEK_SET)<0 ||
+            write(msdos->temp_fd, buf, root_dir_bytes) != (ssize_t)root_dir_bytes) {
+            free(buf);
+            archive_set_error(&a->archive, errno, "FAT12/16 root write failed");
+            return (ARCHIVE_FATAL);
         }
         free(buf);
 
-        /* Also write subdirectories in the data area, if any. */
+        /* Write subdirectories in data area, if any. */
         {
             struct fat_file *dir;
             for (dir=msdos->files; dir; dir=dir->next) {
                 if (dir->is_dir && !dir->is_root && !dir->parent) {
-                    /* This is a top-level subdir. We must write its directory contents. */
                     int num_entries=2; 
                     struct fat_file *c;
                     for (c=msdos->files; c; c=c->next) {
@@ -1137,7 +1126,6 @@ write_root_dir(struct archive_write *a)
     }
 }
 
-/* Generic directory writing for subdirectories or FAT32 root. */
 static int
 write_directory(struct archive_write *a, struct fat_file *dir,
                 struct fat_file **dir_entries, int num_entries)
@@ -1158,7 +1146,6 @@ write_directory(struct archive_write *a, struct fat_file *dir,
     }
     size_t dir_size_bytes = (size_t)dir->size;
     {
-        /* If the stored dir->size isn't big enough, fix it. */
         size_t needed_bytes = total_entries*DIR_ENTRY_SIZE;
         if (needed_bytes>dir_size_bytes) {
             dir_size_bytes = needed_bytes;
@@ -1172,18 +1159,15 @@ write_directory(struct archive_write *a, struct fat_file *dir,
     }
     {
         size_t offset=0;
-        /* "." => points to itself */
         {
             char dot[11] = ".          ";
             offset += write_dir_entry(buf+offset, dot, dir);
         }
-        /* ".." => points to parent or root if none */
         {
             char dotdot[11] = "..         ";
             struct fat_file dummy;
             memset(&dummy, 0, sizeof(dummy));
             dummy.is_dir=1;
-            /* In FAT, if dir->parent is NULL or root, cluster=0 or special? We'll just set zero. */
             offset += write_dir_entry(buf+offset, dotdot, &dummy);
         }
         {
@@ -1203,7 +1187,6 @@ write_directory(struct archive_write *a, struct fat_file *dir,
         }
     }
 
-    /* Now write it to its clusters. */
     {
         size_t cluster_bytes = (size_t)msdos->cluster_size*SECTOR_SIZE;
         size_t bytes_left=dir_size_bytes;
@@ -1377,7 +1360,7 @@ write_dir_entry(unsigned char *buffer, const char *name, struct fat_file *file)
     memcpy(buffer, name, 11);
     buffer[11] = (unsigned char)(file->is_dir ? ATTR_DIRECTORY : ATTR_ARCHIVE);
     buffer[12] = 0;
-    buffer[13] = 0; 
+    buffer[13] = 0;
     archive_le16enc(buffer+14, dos_time);
     archive_le16enc(buffer+16, dos_date);
     archive_le16enc(buffer+18, dos_date);
@@ -1450,13 +1433,13 @@ static int
 count_dir_entries_for_file(struct fat_file *f)
 {
     if (!f->long_name || !*f->long_name) {
-        return 1; 
+        return 1;
     }
     {
         char short_name[12];
         make_short_name(f->long_name, short_name);
         if (strcmp(f->long_name, short_name)==0) {
-            return 1; 
+            return 1;
         } else {
             int name_len = (int)strlen(f->long_name);
             int lfn_count = (name_len+12)/13;
@@ -1465,35 +1448,36 @@ count_dir_entries_for_file(struct fat_file *f)
     }
 }
 
-/* ------------------- NEW UTILITIES FOR SUBDIR + UNIQUE SHORTNAMES ------------------- */
+/* ------------------- FIXED: find_or_create_dir() with parent param ------------------- */
 
-/* Build/find single-level directory with name == dirname. If it doesn't exist, create it. */
 static struct fat_file*
-find_or_create_dir(struct msdosfs *msdos, const char *dirname)
+find_or_create_dir(struct msdosfs *msdos, struct fat_file *parent, const char *dirname)
 {
-    /* See if we already have a directory with that long_name. */
     struct fat_file *f;
     for (f = msdos->files; f; f=f->next) {
-        if (f->is_dir && !f->parent && f->long_name && strcmp(f->long_name, dirname)==0) {
-            return f;
+        if (f->is_dir && f->long_name && strcmp(f->long_name, dirname)==0) {
+            if (f->parent == parent) {
+                /* Found the matching directory with same parent. */
+                return f;
+            }
         }
     }
-    /* Not found => create it. */
+
     f = calloc(1, sizeof(*f));
+    if (!f) return NULL;
     f->is_dir = 1;
     f->long_name = strdup(dirname);
+    f->parent = parent;
     f->next = msdos->files;
     msdos->files = f;
     return f;
 }
 
-/* Check if a short name is already used. */
 static int
 shortname_exists(struct msdosfs *msdos, const char *name)
 {
     struct shortname_list *p = msdos->used_shortnames;
     while (p) {
-        /* Compare case-insensitively or as-is?  Typically 8.3 is upper. We'll do direct. */
         if (memcmp(p->name, name, 11)==0) {
             return 1;
         }
@@ -1502,7 +1486,6 @@ shortname_exists(struct msdosfs *msdos, const char *name)
     return 0;
 }
 
-/* Add short name to used list. */
 static void
 add_shortname(struct msdosfs *msdos, const char *name)
 {
@@ -1514,7 +1497,6 @@ add_shortname(struct msdosfs *msdos, const char *name)
     msdos->used_shortnames = p;
 }
 
-/* Ensure short_name is unique in this image; if not, rename with ~1, ~2, etc. */
 static void
 ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char short_name[12])
 {
@@ -1523,7 +1505,6 @@ ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char sh
         return;
     }
     {
-        /* Must parse out base.ext, then add ~N to the base if needed. */
         char base[9], ext[4];
         memcpy(base, short_name, 8);
         base[8] = '\0';
@@ -1532,10 +1513,7 @@ ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char sh
 
         int i = 1;
         for (;;) {
-            /* Build something like ABCDE~1 if there's room, etc. */
-            /* We attempt "base" up to 6 chars + "~%d" => up to 8 total. */
             char new_base[9];
-            /* We only allow up to ~999999 for safety. */
             snprintf(new_base, sizeof(new_base), "%.6s~%d", base, i);
 
             char temp[12];
@@ -1548,16 +1526,12 @@ ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char sh
                     if (c>='a' && c<='z') c -= 32;
                     temp[j++] = c;
                 }
-                /* Copy extension if any. */
-                {
-                    int k;
-                    for (k=0; k<3; k++) {
-                        char c = ext[k];
-                        temp[8+k] = c;
-                    }
+                int k;
+                for (k=0; k<3; k++) {
+                    char c = ext[k];
+                    temp[8+k] = c;
                 }
             }
-            /* Check if it is used. */
             if (!shortname_exists(msdos, temp)) {
                 strcpy(short_name, temp);
                 add_shortname(msdos, temp);
