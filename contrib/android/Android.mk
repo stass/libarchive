@@ -125,6 +125,7 @@ libarchive_src_files := libarchive/archive_acl.c \
 						libarchive/archive_write_set_format_cpio.c \
 						libarchive/archive_write_set_format_cpio_newc.c \
 						libarchive/archive_write_set_format_iso9660.c \
+						libarchive/archive_write_set_format_msdosfs.c \
 						libarchive/archive_write_set_format_mtree.c \
 						libarchive/archive_write_set_format_pax.c \
 						libarchive/archive_write_set_format_raw.c \

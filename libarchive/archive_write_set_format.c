@@ -48,6 +48,7 @@ struct { int code; int (*setter)(struct archive *); } codes[] =
 	{ ARCHIVE_FORMAT_CPIO_POSIX,	archive_write_set_format_cpio_odc },
 	{ ARCHIVE_FORMAT_CPIO_SVR4_NOCRC,	archive_write_set_format_cpio_newc },
 	{ ARCHIVE_FORMAT_ISO9660,	archive_write_set_format_iso9660 },
+	{ ARCHIVE_FORMAT_MSDOSFS,	archive_write_set_format_msdosfs },
 	{ ARCHIVE_FORMAT_MTREE,		archive_write_set_format_mtree },
 	{ ARCHIVE_FORMAT_RAW,		archive_write_set_format_raw },
 	{ ARCHIVE_FORMAT_SHAR,		archive_write_set_format_shar },
