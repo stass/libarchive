@@ -94,6 +94,7 @@ struct fat_file {
 /* For tracking used short names to ensure uniqueness. */
 struct shortname_list {
     char name[12];
+    struct fat_file *parent_dir; /* Directory context for this short name */
     struct shortname_list *next;
 };
 
@@ -207,7 +208,7 @@ static struct fat_file* find_or_create_dir(struct msdosfs *msdos,
                                            const char *dirname);
 static void add_child_to_parent(struct fat_file *parent, struct fat_file *child);
 
-static void ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char short_name[12]);
+static void ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char short_name[12], struct fat_file *parent_dir);
 
 #ifdef MSDOSFS_DEBUG
 static void debug_print_files(struct msdosfs *msdos) {
@@ -1105,7 +1106,7 @@ write_root_dir(struct archive_write *a)
             char short_name[12];
             make_short_name(f->long_name ? f->long_name : "", short_name);
             DEBUG_PRINT("Processing root file: %s", f->long_name ? f->long_name : "(no name)");
-            ensure_unique_short_name(a, msdos, short_name);
+            ensure_unique_short_name(a, msdos, short_name, NULL);
 
             if (strcmp(f->long_name ? f->long_name : "", short_name)!=0) {
                 DEBUG_PRINT("  Writing LFN entries for: %s", f->long_name);
@@ -1282,7 +1283,7 @@ write_directory(struct archive_write *a, struct fat_file *dir,
                 char short_name[12];
                 DEBUG_PRINT("  Processing directory entry: %s", f->long_name ? f->long_name : "(no name)");
                 make_short_name(f->long_name ? f->long_name : "", short_name);
-                ensure_unique_short_name(a, msdos, short_name);
+                ensure_unique_short_name(a, msdos, short_name, dir);
 
                 if (strcmp(f->long_name ? f->long_name : "", short_name)!=0) {
                     DEBUG_PRINT("    Writing LFN entries for: %s", f->long_name);
@@ -1625,11 +1626,11 @@ add_child_to_parent(struct fat_file *parent, struct fat_file *child)
 }
 
 static int
-shortname_exists(struct msdosfs *msdos, const char *name)
+shortname_exists(struct msdosfs *msdos, const char *name, struct fat_file *parent_dir)
 {
     struct shortname_list *p = msdos->used_shortnames;
     while (p) {
-        if (memcmp(p->name, name, 11)==0) {
+        if (p->parent_dir == parent_dir && memcmp(p->name, name, 11)==0) {
             return 1;
         }
         p = p->next;
@@ -1638,7 +1639,7 @@ shortname_exists(struct msdosfs *msdos, const char *name)
 }
 
 static void
-add_shortname(struct msdosfs *msdos, const char *name)
+add_shortname(struct msdosfs *msdos, const char *name, struct fat_file *parent_dir)
 {
     struct shortname_list *p = malloc(sizeof(*p));
     if (!p) {
@@ -1648,19 +1649,20 @@ add_shortname(struct msdosfs *msdos, const char *name)
     memset(p, 0, sizeof(*p));
     memcpy(p->name, name, 11);
     p->name[11] = '\0';
+    p->parent_dir = parent_dir;
     p->next = msdos->used_shortnames;
     msdos->used_shortnames = p;
-    DEBUG_PRINT("  Added short name to used list: '%s'", name);
+    DEBUG_PRINT("  Added short name to used list: '%s' (parent=%p)", name, (void*)parent_dir);
 }
 
 static void
-ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char short_name[12])
+ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char short_name[12], struct fat_file *parent_dir)
 {
-    DEBUG_PRINT("Ensuring unique short name for: '%s'", short_name);
+    DEBUG_PRINT("Ensuring unique short name for: '%s' (parent=%p)", short_name, (void*)parent_dir);
     
-    /* First check if the name is already unique */
-    if (!shortname_exists(msdos, short_name)) {
-        add_shortname(msdos, short_name);
+    /* First check if the name is already unique in this directory */
+    if (!shortname_exists(msdos, short_name, parent_dir)) {
+        add_shortname(msdos, short_name, parent_dir);
         return;
     }
     
@@ -1719,9 +1721,9 @@ ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char sh
             temp[8+k] = ext[k];
         }
         
-        if (!shortname_exists(msdos, temp)) {
+        if (!shortname_exists(msdos, temp, parent_dir)) {
             memcpy(short_name, temp, 12);
-            add_shortname(msdos, temp);
+            add_shortname(msdos, temp, parent_dir);
             DEBUG_PRINT("  Using unique short name: '%s'", short_name);
             return;
         }
