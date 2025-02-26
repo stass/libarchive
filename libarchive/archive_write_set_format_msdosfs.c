@@ -190,6 +190,8 @@ static int  archive_write_msdosfs_free(struct archive_write *a);
 static int  init_volume_geometry(struct archive_write *a, uint64_t volume_bytes);
 static uint32_t compute_fat_size(struct msdosfs *msdos);
 
+static int assign_subdir_sizes(struct msdosfs *msdos);
+
 static void set_fat12_entry(unsigned char *fat, uint32_t cluster, uint16_t value);
 
 static int write_boot_sector(struct archive_write *a);
@@ -514,6 +516,8 @@ archive_write_msdosfs_close(struct archive_write *a)
         size_t dir_bytes_needed = (size_t)num_entries * DIR_ENTRY_SIZE;
         root_dir->size = (uint32_t)dir_bytes_needed;
     }
+
+    assign_subdir_sizes(msdos);
 
     /* 1) Boot sector. */
     r = write_boot_sector(a);     
@@ -1704,6 +1708,27 @@ add_child_to_parent(struct fat_file *parent, struct fat_file *child)
         }
         sibling->sibling = child;
     }
+}
+
+static int
+assign_subdir_sizes(struct msdosfs *msdos)
+{
+    struct fat_file *f;
+    for (f = msdos->files; f; f = f->next) {
+        if (f->is_dir && !f->is_root) {
+            // Calculate how many dir entries we need.
+            // Start with 2 for "." and "..".
+            int needed_entries = 2;
+            // Add each child in that directory:
+            struct fat_file *c;
+            for (c = f->children; c; c = c->sibling) {
+                needed_entries += count_dir_entries_for_file(c);
+            }
+            // Convert to bytes:
+            f->size = needed_entries * DIR_ENTRY_SIZE;
+        }
+    }
+    return ARCHIVE_OK;
 }
 
 static void
