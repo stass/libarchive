@@ -91,11 +91,17 @@ struct fat_file {
     struct fat_file *sibling;
 };
 
-/* For tracking used short names to ensure uniqueness. */
-struct shortname_list {
+/* Hash table for tracking used short names to ensure uniqueness. */
+#define SHORTNAME_HASH_SIZE 256
+
+struct shortname_entry {
     char name[12];
     struct fat_file *parent_dir; /* Directory context for this short name */
-    struct shortname_list *next;
+    struct shortname_entry *next;
+};
+
+struct shortname_hash {
+    struct shortname_entry *buckets[SHORTNAME_HASH_SIZE];
 };
 
 /* Our main writer state. */
@@ -122,7 +128,7 @@ struct msdosfs {
     size_t write_buffer_size;
     size_t write_buffer_pos;
 
-    struct shortname_list *used_shortnames;
+    struct shortname_hash used_shortnames;
 };
 
 /* Boot sector structures (unchanged) */
@@ -199,9 +205,13 @@ static int write_directory(struct archive_write *a, struct fat_file *dir,
 static int write_cluster_chain(struct archive_write *a, struct fat_file *file);
 
 static void make_short_name(const char *long_name, char *short_name);
+static int  build_colliding_short_name(const char *base, const char *ext, int num, char *short_name);
 static int  write_dir_entry(unsigned char *buffer, const char *name, struct fat_file *file);
 static int  write_long_name_entries(unsigned char *buffer, const char *long_name, const char *short_name);
 static int  count_dir_entries_for_file(struct fat_file *f);
+static unsigned int shortname_hash(const char *name, struct fat_file *parent_dir);
+static int  shortname_exists(struct msdosfs *msdos, const char *name, struct fat_file *parent_dir);
+static void add_shortname(struct msdosfs *msdos, const char *name, struct fat_file *parent_dir);
 
 static struct fat_file* find_or_create_dir(struct msdosfs *msdos,
                                            struct fat_file *parent,
@@ -209,6 +219,7 @@ static struct fat_file* find_or_create_dir(struct msdosfs *msdos,
 static void add_child_to_parent(struct fat_file *parent, struct fat_file *child);
 
 static int ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char short_name[12], struct fat_file *parent_dir);
+static void init_shortname_hash(struct shortname_hash *hash);
 
 #ifdef MSDOSFS_DEBUG
 static void debug_print_files(struct msdosfs *msdos) {
@@ -565,11 +576,14 @@ archive_write_msdosfs_free(struct archive_write *a)
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
     if (msdos) {
         {
-            struct shortname_list *p = msdos->used_shortnames;
-            while (p) {
-                struct shortname_list *nx = p->next;
-                free(p);
-                p = nx;
+            /* Free the shortname hash table */
+            for (int i = 0; i < SHORTNAME_HASH_SIZE; i++) {
+                struct shortname_entry *p = msdos->used_shortnames.buckets[i];
+                while (p) {
+                    struct shortname_entry *nx = p->next;
+                    free(p);
+                    p = nx;
+                }
             }
         }
         {
@@ -1412,8 +1426,8 @@ make_short_name(const char *long_name, char *short_name)
     int i, j=0;
     const char *ext = strrchr(long_name, '.');
     char base[9], extension[4];
-    memset(base,' ',8);
-    memset(extension,' ',3);
+    memset(base, ' ', 8);
+    memset(extension, ' ', 3);
     base[8] = '\0';
     extension[3] = '\0';
 
@@ -1428,19 +1442,31 @@ make_short_name(const char *long_name, char *short_name)
         return;
     }
 
-    /* Create a more varied initial short name to reduce collisions */
-    /* Use first 6 chars + 2 chars from hash for base name */
-    unsigned int name_hash = 0;
-    for (i = 0; long_name[i]; i++) {
-        name_hash = name_hash * 31 + (unsigned char)long_name[i];
+    /* Process extension first */
+    j = 0;
+    if (ext) {
+        ext++; /* Skip the dot */
+        for (i = 0; ext[i] && j < 3; i++) {
+            char c = ext[i];
+            if (c >= 'a' && c <= 'z') c -= 32; /* Uppercase */
+            if (c == ' ' || c == '.') continue;
+            if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || 
+                strchr("$%'-_@~!(){}^#&", c)) {
+                extension[j++] = c;
+            } else {
+                extension[j++] = '_';
+            }
+        }
     }
     
-    /* First fill in with normal 8.3 conversion */
-    for (i=0; long_name[i] && (&long_name[i]!=ext) && j<6; i++) {
+    /* Process base name - try to keep as much of the original name as possible */
+    j = 0;
+    for (i = 0; long_name[i] && (&long_name[i] != ext) && j < 8; i++) {
         char c = long_name[i];
-        if (c>='a' && c<='z') c -= 32;
-        if (c==' '||c=='.') continue;
-        if ((c>='A'&&c<='Z') || (c>='0'&&c<='9') || strchr("$%'-_@~!(){}^#&",c)) {
+        if (c >= 'a' && c <= 'z') c -= 32; /* Uppercase */
+        if (c == ' ' || c == '.') continue;
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || 
+            strchr("$%'-_@~!(){}^#&", c)) {
             base[j++] = c;
         } else {
             base[j++] = '_';
@@ -1450,36 +1476,69 @@ make_short_name(const char *long_name, char *short_name)
     /* Ensure we have at least one character in the base name */
     if (j == 0) {
         base[0] = 'X';
-        j = 1;
-    }
-    
-    /* Add two hash-based characters to make names more unique from the start */
-    if (j <= 6) {
-        static const char hash_chars[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        base[j++] = hash_chars[(name_hash >> 5) % 36];
-        base[j++] = hash_chars[name_hash % 36];
-    }
-    
-    j=0;
-    if (ext) {
-        ext++;
-        for (i=0; ext[i] && j<3; i++) {
-            char c = ext[i];
-            if (c>='a' && c<='z') c-=32;
-            if (c==' '|| c=='.') continue;
-            if ((c>='A'&&c<='Z')||(c>='0'&&c<='9')||strchr("$%'-_@~!(){}^#&",c)) {
-                extension[j++] = c;
-            } else {
-                extension[j++] = '_';
-            }
-        }
     }
 
+    /* Copy the base and extension to the short name */
     memcpy(short_name, base, 8);
     memcpy(short_name+8, extension, 3);
     short_name[11] = '\0';
     
     DEBUG_PRINT("  Created short name: '%s'", short_name);
+}
+
+/* Build a short name with a ~N suffix to resolve collisions */
+static int
+build_colliding_short_name(const char *base, const char *ext, int num, char *short_name)
+{
+    char new_base[9];
+    int base_len = 0;
+    
+    /* Count non-space characters in base */
+    while (base_len < 8 && base[base_len] != ' ') {
+        base_len++;
+    }
+    
+    /* Determine how many digits we need for the numeric part */
+    int num_digits = 1;
+    int temp_num = num;
+    while (temp_num >= 10) {
+        num_digits++;
+        temp_num /= 10;
+    }
+    
+    /* We need at least 2 chars for "~N" */
+    int max_base_chars = 8 - (num_digits + 1);
+    if (max_base_chars < 1) {
+        /* This should never happen with reasonable numbers */
+        return -1;
+    }
+    
+    /* Keep only the first max_base_chars of the base name */
+    if (base_len > max_base_chars) {
+        base_len = max_base_chars;
+    }
+    
+    /* Copy the base name */
+    memcpy(new_base, base, base_len);
+    
+    /* Add the ~N suffix */
+    new_base[base_len] = '~';
+    sprintf(new_base + base_len + 1, "%d", num);
+    
+    /* Pad with spaces to 8 characters */
+    memset(short_name, ' ', 11);
+    
+    /* Copy the new base name */
+    int new_base_len = strlen(new_base);
+    if (new_base_len > 8) new_base_len = 8;
+    memcpy(short_name, new_base, new_base_len);
+    
+    /* Copy the extension */
+    memcpy(short_name + 8, ext, 3);
+    
+    short_name[11] = '\0';
+    
+    return 0;
 }
 
 static int
@@ -1645,34 +1704,67 @@ add_child_to_parent(struct fat_file *parent, struct fat_file *child)
     }
 }
 
+static void
+init_shortname_hash(struct shortname_hash *hash)
+{
+    memset(hash->buckets, 0, sizeof(hash->buckets));
+}
+
+static unsigned int
+shortname_hash(const char *name, struct fat_file *parent_dir)
+{
+    unsigned int hash = 0;
+    
+    /* Hash the parent directory pointer */
+    uintptr_t ptr_val = (uintptr_t)parent_dir;
+    hash = (unsigned int)(ptr_val ^ (ptr_val >> 16));
+    
+    /* Hash the name (all 11 bytes) */
+    for (int i = 0; i < 11; i++) {
+        hash = hash * 31 + (unsigned char)name[i];
+    }
+    
+    return hash % SHORTNAME_HASH_SIZE;
+}
+
 static int
 shortname_exists(struct msdosfs *msdos, const char *name, struct fat_file *parent_dir)
 {
-    struct shortname_list *p = msdos->used_shortnames;
+    unsigned int hash_val = shortname_hash(name, parent_dir);
+    struct shortname_entry *p = msdos->used_shortnames.buckets[hash_val];
+    
     while (p) {
-        if (p->parent_dir == parent_dir && memcmp(p->name, name, 11)==0) {
+        if (p->parent_dir == parent_dir && memcmp(p->name, name, 11) == 0) {
             return 1;
         }
         p = p->next;
     }
+    
     return 0;
 }
 
 static void
 add_shortname(struct msdosfs *msdos, const char *name, struct fat_file *parent_dir)
 {
-    struct shortname_list *p = malloc(sizeof(*p));
+    unsigned int hash_val = shortname_hash(name, parent_dir);
+    struct shortname_entry *p = malloc(sizeof(*p));
+    
     if (!p) {
         DEBUG_PRINT("  ERROR: Failed to allocate memory for short name: '%s'", name);
         return;
     }
+    
     memset(p, 0, sizeof(*p));
     memcpy(p->name, name, 11);
     p->name[11] = '\0';
     p->parent_dir = parent_dir;
-    p->next = msdos->used_shortnames;
-    msdos->used_shortnames = p;
-    DEBUG_PRINT("  Added short name to used list: '%s' (parent=%p)", name, (void*)parent_dir);
+    
+    /* Add to the hash bucket */
+    p->next = msdos->used_shortnames.buckets[hash_val];
+    msdos->used_shortnames.buckets[hash_val] = p;
+    
+    DEBUG_PRINT("  Added short name to hash: '%s' (parent=%p, bucket=%u)", 
+                name, (void*)parent_dir, hash_val);
 }
 
 static int
@@ -1686,74 +1778,47 @@ ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char sh
         return (0);
     }
     
-    /* Need to make the name unique */
+    /* Need to make the name unique by adding ~N suffix */
     char base[9], ext[4];
+    
+    /* Extract base and extension */
     memcpy(base, short_name, 8);
     base[8] = '\0';
     memcpy(ext, short_name+8, 3);
     ext[3] = '\0';
     
-    /* Trim trailing spaces from base */
-    int base_len = 8;
-    while (base_len > 0 && base[base_len-1] == ' ') {
-        base_len--;
-    }
-    base[base_len] = '\0';
+    DEBUG_PRINT("  Name collision - base: '%s', ext: '%s'", base, ext);
     
-    DEBUG_PRINT("  Base name: '%s', Extension: '%s'", base, ext);
-
-    int i = 1;
-    for (;;) {
-        /* Determine how many digits we need for the numeric part */
-        int num_digits = 1;
-        int temp_i = i;
-        while (temp_i >= 10) {
-            num_digits++;
-            temp_i /= 10;
-        }
-        
-        /* Make sure we have room for ~N (need at least 2 chars) */
-        int max_base_chars = 6;
-        if (base_len < max_base_chars) {
-            max_base_chars = base_len;
-        }
-        
-        /* Create the new base name with ~N suffix */
-        char new_base[9];
-        snprintf(new_base, sizeof(new_base), "%.*s~%d", 
-                 max_base_chars, base, i);
-        
-        /* Create the full short name */
+    /* Try with increasing numbers until we find a unique name */
+    for (int i = 1; i <= 999999; i++) {
         char temp[12];
-        memset(temp, ' ', 11);
-        temp[11] = '\0';
         
-        /* Copy the new base name */
-        int j=0;
-        while (new_base[j] && j<8) {
-            char c = new_base[j];
-            if (c>='a' && c<='z') c -= 32;
-            temp[j++] = c;
+        if (build_colliding_short_name(base, ext, i, temp) != 0) {
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                "Failed to build collision-resolving short name");
+            return (ARCHIVE_FATAL);
         }
         
-        /* Copy the extension */
-        for (int k=0; k<3; k++) {
-            temp[8+k] = ext[k];
-        }
+        DEBUG_PRINT("  Trying collision name: '%s'", temp);
         
         if (!shortname_exists(msdos, temp, parent_dir)) {
+            /* Found a unique name */
             memcpy(short_name, temp, 12);
             add_shortname(msdos, temp, parent_dir);
             DEBUG_PRINT("  Using unique short name: '%s'", short_name);
             return (0);
         }
         
-        i++;
-        if (i > 999999) {
+        /* If we've tried too many, give up to avoid infinite loops */
+        if (i == 999999) {
             archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-                "Too many short name collisions");
+                "Too many short name collisions (999999 attempts)");
             DEBUG_PRINT("  ERROR: Too many short name collisions!");
             return (ARCHIVE_FATAL);
         }
     }
+    
+    /* Should never reach here */
+    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC, "Unexpected error in short name collision resolution");
+    return (ARCHIVE_FATAL);
 }
