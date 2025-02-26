@@ -1428,7 +1428,15 @@ make_short_name(const char *long_name, char *short_name)
         return;
     }
 
-    for (i=0; long_name[i] && (&long_name[i]!=ext) && j<8; i++) {
+    /* Create a more varied initial short name to reduce collisions */
+    /* Use first 6 chars + 2 chars from hash for base name */
+    unsigned int name_hash = 0;
+    for (i = 0; long_name[i]; i++) {
+        name_hash = name_hash * 31 + (unsigned char)long_name[i];
+    }
+    
+    /* First fill in with normal 8.3 conversion */
+    for (i=0; long_name[i] && (&long_name[i]!=ext) && j<6; i++) {
         char c = long_name[i];
         if (c>='a' && c<='z') c -= 32;
         if (c==' '||c=='.') continue;
@@ -1442,6 +1450,14 @@ make_short_name(const char *long_name, char *short_name)
     /* Ensure we have at least one character in the base name */
     if (j == 0) {
         base[0] = 'X';
+        j = 1;
+    }
+    
+    /* Add two hash-based characters to make names more unique from the start */
+    if (j <= 6) {
+        static const char hash_chars[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        base[j++] = hash_chars[(name_hash >> 5) % 36];
+        base[j++] = hash_chars[name_hash % 36];
     }
     
     j=0;
