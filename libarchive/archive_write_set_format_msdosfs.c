@@ -293,6 +293,8 @@ archive_write_set_format_msdosfs(struct archive *_a)
     a->format_finish_entry   = archive_write_msdosfs_finish_entry;
     a->format_close          = archive_write_msdosfs_close;
     a->format_free           = archive_write_msdosfs_free;
+    
+    init_shortname_hash(&msdos->used_shortnames);
 
     return (ARCHIVE_OK);
 }
