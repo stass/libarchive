@@ -40,6 +40,7 @@
 #include "archive_write_private.h"
 
 /* Debug macros */
+#define MSDOSFS_DEBUG
 #ifdef MSDOSFS_DEBUG
 #define DEBUG_PRINT(fmt, ...) fprintf(stderr, "MSDOSFS: " fmt "\n", ##__VA_ARGS__)
 #define DEBUG_FILES(msdos) debug_print_files(msdos)
