@@ -1028,8 +1028,8 @@ write_root_dir(struct archive_write *a)
 
         struct fat_file *f;
         for (f=msdos->files; f; f=f->next) {
-            /* Only top-level items (parent==NULL or is_root). */
-            if (!f->is_root && f->parent != NULL) {
+            /* Only top-level items (parent==NULL). */
+            if (f->parent != NULL) {
                 continue;
             }
             char short_name[12];
@@ -1104,14 +1104,14 @@ write_subdirectories_recursively(struct archive_write *a, struct fat_file *paren
                 return (ARCHIVE_FATAL);
             }
             int idx=0;
-            sublist[idx++] = dir;
-            sublist[idx++] = NULL;
+            sublist[idx++] = dir;      /* "." entry */
+            sublist[idx++] = parent;   /* ".." entry - use actual parent instead of NULL */
             for (c = msdos->files; c; c=c->next) {
                 if (c->parent == dir) {
                     sublist[idx++] = c;
                 }
             }
-            r = write_directory(a, dir, sublist, num_entries);
+            r = write_directory(a, dir, sublist, idx);
             free(sublist);
             if (r != ARCHIVE_OK)
                 return r;
@@ -1167,10 +1167,16 @@ write_directory(struct archive_write *a, struct fat_file *dir,
         }
         {
             char dotdot[11] = "..         ";
-            struct fat_file dummy;
-            memset(&dummy, 0, sizeof(dummy));
-            dummy.is_dir=1;
-            offset += write_dir_entry(buf+offset, dotdot, &dummy);
+            struct fat_file *parent_dir = dir_entries[1]; /* The parent directory is at index 1 */
+            if (parent_dir) {
+                offset += write_dir_entry(buf+offset, dotdot, parent_dir);
+            } else {
+                /* If no parent (root), use a dummy entry with no cluster */
+                struct fat_file dummy;
+                memset(&dummy, 0, sizeof(dummy));
+                dummy.is_dir=1;
+                offset += write_dir_entry(buf+offset, dotdot, &dummy);
+            }
         }
         {
             int i;
