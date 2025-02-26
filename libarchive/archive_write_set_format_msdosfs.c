@@ -195,6 +195,7 @@ static int  count_dir_entries_for_file(struct fat_file *f);
 static struct fat_file* find_or_create_dir(struct msdosfs *msdos,
                                            struct fat_file *parent,
                                            const char *dirname);
+static void add_child_to_parent(struct fat_file *parent, struct fat_file *child);
 
 static void ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char short_name[12]);
 
@@ -311,6 +312,12 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
             if (next) {
                 /* Intermediate directory name. */
                 parent_dir = find_or_create_dir(msdos, parent_dir, token);
+                if (!parent_dir) {
+                    archive_set_error(&a->archive, ENOMEM, "Failed to create directory");
+                    free(pathdup);
+                    free(file);
+                    return (ARCHIVE_FATAL);
+                }
             } else {
                 /* Last component => file or final dir name. */
                 last_component = token;
@@ -320,10 +327,20 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
         if (last_component) {
             file->long_name = strdup(last_component);
             file->parent = parent_dir;
+            
+            /* Add this file to its parent's children list */
+            if (parent_dir) {
+                add_child_to_parent(parent_dir, file);
+            }
         } else {
             /* Means empty or all slash => treat as the single name in root? */
             file->long_name = strdup(pathdup);
             file->parent = parent_dir;
+            
+            /* Add this file to its parent's children list */
+            if (parent_dir) {
+                add_child_to_parent(parent_dir, file);
+            }
         }
         free(pathdup);
     }
@@ -1074,7 +1091,7 @@ write_root_dir(struct archive_write *a)
     }
 }
 
-/// FIX START: New helper function to recursively write subdirectories under `parent`.
+/// Improved helper function to recursively write subdirectories under `parent`.
 static int
 write_subdirectories_recursively(struct archive_write *a, struct fat_file *parent)
 {
@@ -1092,25 +1109,35 @@ write_subdirectories_recursively(struct archive_write *a, struct fat_file *paren
              * Gather all children of 'dir', build a small array, then write_directory().
              */
             int num_entries = 2; /* "." + ".." */
+            
+            /* First count the number of entries needed */
             struct fat_file *c;
             for (c = msdos->files; c; c=c->next) {
                 if (c->parent == dir) {
                     num_entries += count_dir_entries_for_file(c);
                 }
             }
-            struct fat_file **sublist = calloc((size_t)num_entries, sizeof(*sublist));
+            
+            /* Allocate the array with some extra space just in case */
+            struct fat_file **sublist = calloc((size_t)(num_entries + 5), sizeof(*sublist));
             if (!sublist) {
                 archive_set_error(&a->archive, ENOMEM, "No mem for subdir list");
                 return (ARCHIVE_FATAL);
             }
+            
+            /* Fill the array */
             int idx=0;
             sublist[idx++] = dir;      /* "." entry */
             sublist[idx++] = parent;   /* ".." entry - use actual parent instead of NULL */
+            
+            /* Add all direct children */
             for (c = msdos->files; c; c=c->next) {
                 if (c->parent == dir) {
                     sublist[idx++] = c;
                 }
             }
+            
+            /* Write this directory */
             r = write_directory(a, dir, sublist, idx);
             free(sublist);
             if (r != ARCHIVE_OK)
@@ -1126,7 +1153,6 @@ write_subdirectories_recursively(struct archive_write *a, struct fat_file *paren
     }
     return ARCHIVE_OK;
 }
-/// FIX END
 
 static int
 write_directory(struct archive_write *a, struct fat_file *dir,
@@ -1475,7 +1501,31 @@ find_or_create_dir(struct msdosfs *msdos, struct fat_file *parent, const char *d
     f->parent = parent;
     f->next = msdos->files;
     msdos->files = f;
+    
+    /* Add this directory to its parent's children list */
+    if (parent) {
+        add_child_to_parent(parent, f);
+    }
+    
     return f;
+}
+
+static void
+add_child_to_parent(struct fat_file *parent, struct fat_file *child)
+{
+    if (!parent || !child)
+        return;
+        
+    /* Add child to parent's children list */
+    if (parent->children == NULL) {
+        parent->children = child;
+    } else {
+        struct fat_file *sibling = parent->children;
+        while (sibling->sibling != NULL) {
+            sibling = sibling->sibling;
+        }
+        sibling->sibling = child;
+    }
 }
 
 static int
