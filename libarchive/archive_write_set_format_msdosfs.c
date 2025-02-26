@@ -1627,16 +1627,13 @@ add_child_to_parent(struct fat_file *parent, struct fat_file *child)
 static int
 shortname_exists(struct msdosfs *msdos, const char *name)
 {
-    DEBUG_PRINT("  Checking if short name exists: '%s'", name);
     struct shortname_list *p = msdos->used_shortnames;
     while (p) {
         if (memcmp(p->name, name, 11)==0) {
-            DEBUG_PRINT("  Short name already exists: '%s'", name);
             return 1;
         }
         p = p->next;
     }
-    DEBUG_PRINT("  Short name is unique: '%s'", name);
     return 0;
 }
 
@@ -1704,8 +1701,6 @@ ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char sh
         snprintf(new_base, sizeof(new_base), "%.*s~%d", 
                  max_base_chars, base, i);
         
-        DEBUG_PRINT("  Trying modified base: '%s'", new_base);
-
         /* Create the full short name */
         char temp[12];
         memset(temp, ' ', 11);
@@ -1723,8 +1718,6 @@ ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char sh
         for (int k=0; k<3; k++) {
             temp[8+k] = ext[k];
         }
-        
-        DEBUG_PRINT("  Checking candidate short name: '%s'", temp);
         
         if (!shortname_exists(msdos, temp)) {
             memcpy(short_name, temp, 12);
