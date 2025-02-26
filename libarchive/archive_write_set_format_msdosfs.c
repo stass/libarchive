@@ -39,6 +39,15 @@
 #include "archive_private.h"
 #include "archive_write_private.h"
 
+/* Debug macros */
+#ifdef MSDOSFS_DEBUG
+#define DEBUG_PRINT(fmt, ...) fprintf(stderr, "MSDOSFS: " fmt "\n", ##__VA_ARGS__)
+#define DEBUG_FILES(msdos) debug_print_files(msdos)
+#else
+#define DEBUG_PRINT(fmt, ...)
+#define DEBUG_FILES(msdos)
+#endif
+
 /* 512-byte sectors. */
 #define SECTOR_SIZE 512
 
@@ -199,6 +208,25 @@ static void add_child_to_parent(struct fat_file *parent, struct fat_file *child)
 
 static void ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos, char short_name[12]);
 
+#ifdef MSDOSFS_DEBUG
+static void debug_print_files(struct msdosfs *msdos) {
+    int count = 0;
+    fprintf(stderr, "MSDOSFS: ---- File List ----\n");
+    struct fat_file *f;
+    for (f = msdos->files; f; f = f->next) {
+        count++;
+        fprintf(stderr, "MSDOSFS: [%d] %s (is_dir=%d, parent=%p, first_cluster=%u)\n", 
+                count, 
+                f->long_name ? f->long_name : "(no name)", 
+                f->is_dir, 
+                (void*)f->parent,
+                f->first_cluster);
+    }
+    fprintf(stderr, "MSDOSFS: Total files: %d\n", count);
+    fprintf(stderr, "MSDOSFS: ------------------\n");
+}
+#endif
+
 /* ------------------- PUBLIC ENTRY POINT ------------------- */
 
 int
@@ -281,6 +309,7 @@ static int
 archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entry)
 {
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
+    DEBUG_PRINT("Processing header for %s", archive_entry_pathname(entry));
     struct fat_file *file = calloc(1, sizeof(*file));
     if (!file) {
         archive_set_error(&a->archive, ENOMEM, "Can't allocate fat_file");
@@ -307,10 +336,12 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
         token = strtok_r(pathdup, "/", &brkt);
         char *last_component = NULL;
 
+        DEBUG_PRINT("Splitting path: %s", pathname);
         while (token) {
             char *next = strtok_r(NULL, "/", &brkt);
             if (next) {
                 /* Intermediate directory name. */
+                DEBUG_PRINT("  Intermediate dir: %s", token);
                 parent_dir = find_or_create_dir(msdos, parent_dir, token);
                 if (!parent_dir) {
                     archive_set_error(&a->archive, ENOMEM, "Failed to create directory");
@@ -320,6 +351,7 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
                 }
             } else {
                 /* Last component => file or final dir name. */
+                DEBUG_PRINT("  Last component: %s", token);
                 last_component = token;
             }
             token = next;
@@ -328,6 +360,7 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
             file->long_name = strdup(last_component);
             file->parent = parent_dir;
             
+            DEBUG_PRINT("  Adding %s to parent %p", last_component, (void*)parent_dir);
             /* Add this file to its parent's children list */
             if (parent_dir) {
                 add_child_to_parent(parent_dir, file);
@@ -347,7 +380,11 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
 
     file->next = msdos->files;
     msdos->files = file;
-
+    DEBUG_PRINT("Added file to list: %s (is_dir=%d, parent=%p)", 
+                file->long_name ? file->long_name : "(no name)", 
+                file->is_dir, 
+                (void*)file->parent);
+    
     if (!file->is_dir) {
         msdos->current_file = file;
         msdos->bytes_remaining = file->size;
@@ -410,6 +447,9 @@ archive_write_msdosfs_close(struct archive_write *a)
 {
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
     int r;
+    
+    DEBUG_PRINT("Closing archive");
+    DEBUG_FILES(msdos);
 
     if (msdos->fat_type == 12 || msdos->fat_type == 16) {
         int needed_entries = 0;
@@ -977,6 +1017,8 @@ static int
 write_root_dir(struct archive_write *a)
 {
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
+    DEBUG_PRINT("Writing root directory");
+    DEBUG_FILES(msdos);
     if (msdos->fat_type==32) {
         /* FAT32 => root is just a normal directory chain. */
         struct fat_file *root_dir = NULL;
@@ -1042,13 +1084,16 @@ write_root_dir(struct archive_write *a)
             return (ARCHIVE_FATAL);
         }
         size_t offset=0;
+        int root_file_count = 0;
 
+        DEBUG_PRINT("Writing FAT12/16 root directory entries");
         struct fat_file *f;
         for (f=msdos->files; f; f=f->next) {
             /* Only top-level items (parent==NULL). */
             if (f->parent != NULL) {
                 continue;
             }
+            root_file_count++;
             char short_name[12];
             make_short_name(f->long_name ? f->long_name : "", short_name);
             ensure_unique_short_name(a, msdos, short_name);
@@ -1069,6 +1114,8 @@ write_root_dir(struct archive_write *a)
             }
             offset += write_dir_entry(buf+offset, short_name, f);
         }
+        
+        DEBUG_PRINT("Added %d files to root directory", root_file_count);
 
         off_t root_off = (off_t)(msdos->root_offset)*SECTOR_SIZE;
         if (lseek(msdos->temp_fd, root_off, SEEK_SET)<0 ||
@@ -1097,7 +1144,9 @@ write_subdirectories_recursively(struct archive_write *a, struct fat_file *paren
 {
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
     int r;
+    int dir_count = 0;
 
+    DEBUG_PRINT("Writing subdirectories recursively (parent=%p)", (void*)parent);
     /* Find all directories that have parent == `parent` (excluding root if parent=NULL?). */
     struct fat_file *dir;
     for (dir = msdos->files; dir; dir=dir->next) {
@@ -1105,6 +1154,10 @@ write_subdirectories_recursively(struct archive_write *a, struct fat_file *paren
         if (!dir->is_dir || dir->is_root)
             continue;
         if (dir->parent == parent) {
+            dir_count++;
+            DEBUG_PRINT("Found directory to process: %s (parent=%p)", 
+                       dir->long_name ? dir->long_name : "(no name)", 
+                       (void*)parent);
             /*
              * Gather all children of 'dir', build a small array, then write_directory().
              */
@@ -1151,6 +1204,7 @@ write_subdirectories_recursively(struct archive_write *a, struct fat_file *paren
                 return r;
         }
     }
+    DEBUG_PRINT("Processed %d directories with parent %p", dir_count, (void*)parent);
     return ARCHIVE_OK;
 }
 
@@ -1159,6 +1213,9 @@ write_directory(struct archive_write *a, struct fat_file *dir,
                 struct fat_file **dir_entries, int num_entries)
 {
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
+    DEBUG_PRINT("Writing directory: %s (entries=%d)", 
+               dir->long_name ? dir->long_name : "(root)", 
+               num_entries);
     if (dir->cluster_count==0) {
         return ARCHIVE_OK;
     }
@@ -1485,10 +1542,12 @@ count_dir_entries_for_file(struct fat_file *f)
 static struct fat_file*
 find_or_create_dir(struct msdosfs *msdos, struct fat_file *parent, const char *dirname)
 {
+    DEBUG_PRINT("Finding or creating directory: %s (parent=%p)", dirname, (void*)parent);
     struct fat_file *f;
     for (f = msdos->files; f; f=f->next) {
         if (f->is_dir && f->long_name && strcmp(f->long_name, dirname)==0) {
             if (f->parent == parent) {
+                DEBUG_PRINT("  Found existing directory: %s", dirname);
                 return f;
             }
         }
@@ -1501,6 +1560,8 @@ find_or_create_dir(struct msdosfs *msdos, struct fat_file *parent, const char *d
     f->parent = parent;
     f->next = msdos->files;
     msdos->files = f;
+    
+    DEBUG_PRINT("  Created new directory: %s (parent=%p)", dirname, (void*)parent);
     
     /* Add this directory to its parent's children list */
     if (parent) {
