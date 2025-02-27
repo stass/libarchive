@@ -825,7 +825,7 @@ write_boot_sector(struct archive_write *a)
     {
         struct bs2 *bs2;
         if (msdos->fat_type == 32) {
-            bs2 = (struct bs2 *)(boot + 90);
+            bs2 = &hdr->bs2;
         } else {
             bs2 = (struct bs2 *)(boot + 36);
         }
