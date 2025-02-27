@@ -1378,8 +1378,6 @@ write_directory(struct archive_write *a, struct fat_file *dir,
     size_t offset = 0;
     for (int i = 0; i < num_entries; i++) {
         struct fat_file *f = dir_entries[i];
-        if (!f)
-            continue;
 
         if (f == dir) {
             /* 
@@ -1396,11 +1394,13 @@ write_directory(struct archive_write *a, struct fat_file *dir,
              */
             char dotdot[11] = "..         ";
 
-            /* We may need to override the cluster to 0 if the parent is the FAT32 root. */
-             int parent_is_fat32_root =
-                (msdos->fat_type == 32 && f && f->is_root);
+            if (f == NULL && (msdos->fat_type == 12 || msdos->fat_type == 16)) {
+                struct fat_file dummy = {0};
+                dummy.is_dir = 1;              // So attribute=0x10
+                dummy.first_cluster = 0;       // Root dir
 
-            if (parent_is_fat32_root) {
+                offset += write_dir_entry(msdos->fat_type, buf + offset, dotdot, &dummy);
+	    } else if (msdos->fat_type == 32 && f && f->is_root) {
                 /*
                  * Make a temporary dummy copy of *f so that its 'first_cluster' = 0,
                  * just for writing this directory entry. We do NOT permanently change
@@ -1413,9 +1413,12 @@ write_directory(struct archive_write *a, struct fat_file *dir,
                 dummy.first_cluster = 0;
 
                 offset += write_dir_entry(msdos->fat_type, buf + offset, dotdot, &dummy);
-            } else {
+            } else if (f!= NULL) {
                 /* Normal case => write real parent's cluster. */
                 offset += write_dir_entry(msdos->fat_type, buf + offset, dotdot, f);
+            } else {
+                archive_set_error(&a->archive, ARCHIVE_FATAL, "f is NULL");
+                return (ARCHIVE_FATAL);
             }
         }
         else {
