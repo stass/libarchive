@@ -1346,24 +1346,22 @@ write_directory(struct archive_write *a, struct fat_file *dir,
                 dir->first_cluster,
                 dir->size);
 
+    /* If no clusters allocated, nothing to write. */
     if (dir->cluster_count == 0) {
-        /* Means no cluster was allocated (e.g. zero-size root on FAT12/16). */
         return ARCHIVE_OK;
     }
 
     /*
-     * total_entries accounts for the LFN expansions. We compute that 
-     * so we can figure out how many bytes we truly need in the buffer.
+     * Compute how many total 32-byte entries we need 
+     * (including LFN slots).
      */
     size_t total_entries = 0;
     for (int i = 0; i < num_entries; i++) {
-        struct fat_file *f = dir_entries[i];
-        if (!f) continue; 
-        /* '.' or '..' are counted like normal but have no LFN overhead. */
-        total_entries += (size_t)count_dir_entries_for_file(f);
+        if (!dir_entries[i]) continue;
+        total_entries += (size_t)count_dir_entries_for_file(dir_entries[i]);
     }
 
-    /* We must ensure we have at least that many 32-byte slots. */
+    /* Compare against the directory’s allocated size. */
     size_t needed_bytes = total_entries * DIR_ENTRY_SIZE;
     size_t dir_size_bytes = (size_t)dir->size;
     if (needed_bytes > dir_size_bytes) {
@@ -1376,51 +1374,76 @@ write_directory(struct archive_write *a, struct fat_file *dir,
         return (ARCHIVE_FATAL);
     }
 
-    /* Build the on-disk directory entries. */
+    /* Build our on-disk directory entries. */
     size_t offset = 0;
     for (int i = 0; i < num_entries; i++) {
         struct fat_file *f = dir_entries[i];
         if (!f)
             continue;
 
-        /* Special case for '.' and '..': they use the short-name "`.`" or "`..`" in the first 11 bytes. */
         if (f == dir) {
-            /* '.' entry => shortname is ".          " (dot + 10 spaces) */
+            /* 
+             * '.' entry => shortname is ".          " (1 dot + 10 spaces).
+             * "f == dir" means the item is the directory itself => this is "."
+             */
             char dot[11] = ".          ";
             offset += write_dir_entry(msdos->fat_type, buf + offset, dot, dir);
         }
-        else if (i == 1 && f->is_dir) {
-            /* '..' entry => shortname is "..         " (two dots + 9 spaces).
-             * If `f` is valid, link it. Otherwise it's a dummy. */
+        else if (i == 1) {
+            /*
+             * The second element in dir_entries[] we treat as '..':
+             * shortname is "..         " (2 dots + 9 spaces).
+             */
             char dotdot[11] = "..         ";
-            offset += write_dir_entry(msdos->fat_type, buf + offset, dotdot, f);
+
+            /* We may need to override the cluster to 0 if the parent is the FAT32 root. */
+             int parent_is_fat32_root =
+                (msdos->fat_type == 32 && f && f->is_root);
+
+            if (parent_is_fat32_root) {
+                /*
+                 * Make a temporary dummy copy of *f so that its 'first_cluster' = 0,
+                 * just for writing this directory entry. We do NOT permanently change
+                 * f->first_cluster, because we still want to store real data for the root.
+                 * 
+                 * This is the key fix to avoid the "non-zero start cluster" fsck_msdos warning
+                 * for '..' in subdirectories of the FAT32 root.
+                 */
+                struct fat_file dummy = *f;
+                dummy.first_cluster = 0;
+
+                offset += write_dir_entry(msdos->fat_type, buf + offset, dotdot, &dummy);
+            } else {
+                /* Normal case => write real parent's cluster. */
+                offset += write_dir_entry(msdos->fat_type, buf + offset, dotdot, f);
+            }
         }
         else {
-            /* Normal file/dir entry, possibly with LFN(s). */
+            /*
+             * A normal file/directory entry. Possibly with LFN.
+             */
             char short_name[12];
             make_short_name(f->long_name ? f->long_name : "", short_name);
 
-            /* Ensure it doesn't collide with siblings. */
+            /* Ensure no collisions with siblings. */
             int error = ensure_unique_short_name(a, msdos, short_name, dir);
             if (error != 0) {
                 free(buf);
                 return (ARCHIVE_FATAL);
             }
 
-            /* If long_name differs from short_name, write LFN entries. */
+            /* If there is a long name different from the short name, write LFN. */
             if (f->long_name && f->long_name[0] != '\0'
                 && strcmp(f->long_name, short_name) != 0)
             {
                 offset += write_long_name_entries(buf + offset, f->long_name, short_name);
             }
-
-            /* Then the real 32-byte entry. */
             offset += write_dir_entry(msdos->fat_type, buf + offset, short_name, f);
         }
     }
 
-    /*
-     * Now write the directory cluster(s) out to the temporary file.
+    /* 
+     * Now write the completed directory data into its clusters.
      */
     size_t cluster_bytes = (size_t)msdos->cluster_size * SECTOR_SIZE;
     size_t bytes_left = dir_size_bytes;
@@ -1428,10 +1451,10 @@ write_directory(struct archive_write *a, struct fat_file *dir,
     unsigned char *p = buf;
 
     while (bytes_left > 0) {
-        size_t chunk = (bytes_left < cluster_bytes) ? bytes_left : cluster_bytes;
+        size_t chunk = (bytes_left < cluster_bytes)? bytes_left : cluster_bytes;
 
         off_t cluster_off = (off_t)(msdos->data_offset
-            + (cluster - FAT_RESERVED_ENTRIES) * msdos->cluster_size) * SECTOR_SIZE;
+            + (cluster - FAT_RESERVED_ENTRIES)*msdos->cluster_size) * SECTOR_SIZE;
 
         if (lseek(msdos->temp_fd, cluster_off, SEEK_SET) < 0 ||
             write(msdos->temp_fd, p, chunk) != (ssize_t)chunk)
@@ -1441,7 +1464,7 @@ write_directory(struct archive_write *a, struct fat_file *dir,
             return (ARCHIVE_FATAL);
         }
 
-        /* If chunk < cluster_bytes, pad the remainder with zeros. */
+        /* Zero-pad the remainder of the cluster if chunk < cluster_bytes. */
         if (chunk < cluster_bytes) {
             char zero[SECTOR_SIZE];
             memset(zero, 0, sizeof(zero));
