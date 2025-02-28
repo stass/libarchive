@@ -1653,82 +1653,82 @@ write_one_dir_entry(unsigned char *buf, const char shortnm[12],
 
 /* Write the required LFN entries just before the final short entry. */
 static void
-write_longname_entries(unsigned char *buf, const char *lname,
+write_longname_entries(unsigned char *dirbuf, const char *lname,
                        const char shortnm[12])
 {
-    /* Each LFN directory entry can store 13 UTF-16 chars. */
+    // Number of 13-character LFN entries needed:
     int name_len = (int)strlen(lname);
-    int entries_needed = (name_len + 12) / 13;  /* +12 ensures room for a '\0' if length is multiple of 13 */
+    int entries_needed = (name_len + 12) / 13;
 
-    /* Compute the LFN checksum from the short (8.3) name. */
-    unsigned char sum = 0;
-    for (int i = 0; i < 11; i++) {
-        sum = (unsigned char)(((sum & 1) ? 0x80 : 0) +
-                              (sum >> 1) +
-                              (unsigned char)shortnm[i]);
-    }
+    // Compute the standard LFN checksum from the short 8.3 name:
+    unsigned char checksum = 0;
+    for (int i = 0; i < 11; i++)
+        checksum = (unsigned char)((checksum >> 1) + ((checksum & 1) ? 0x80 : 0) + shortnm[i]);
 
-    /*
-     * In your existing loop, the highest ordinal (with 0x40 bit) appears
-     * at buffer offset i=0 (the final iteration), and the lowest ordinal
-     * ends up at the highest offset in memory.  So we track 'pos' from
-     * the start of the string, and each iteration handles the next 13 chars.
-     */
-    int pos = 0;  /* index into lname[] */
+    // We'll copy in 13-char chunks from the front to the back of lname,
+    // but physically place them in the directory from last to first.
+    int pos = 0;  // index into lname
 
-    for (int i = entries_needed - 1; i >= 0; i--) {
-        /* The physical location in the buffer for this LFN chunk: */
-        unsigned char *ent = buf + (i * DIR_ENTRY_SIZE);
+    for (int chunk_idx = 0; chunk_idx < entries_needed; chunk_idx++) {
+        // This LFN ordinal is 1..N in ascending order:
+        int ordinal = chunk_idx + 1;
+        // If it's the last chunk, set 0x40:
+        if (ordinal == entries_needed)
+            ordinal |= 0x40;
 
-        /* Zero this entire 32-byte LFN slot so that cluster fields = 0, etc. */
-        memset(ent, 0, DIR_ENTRY_SIZE);
+        // Physically, chunk N (ordinal = N | 0x40) goes at offset 0,
+        // chunk N-1 at offset 32, etc.
+        unsigned char *lfn_ent =
+            dirbuf + (entries_needed - 1 - chunk_idx) * 32;
 
-        /*
-         * ord = 1..entries_needed in ascending order.
-         * If ord == entries_needed, set the "last entry" bit (0x40).
-         */
-        int ord = entries_needed - i;
-        if (ord == entries_needed) {
-            ord |= 0x40; /* highest ordinal => LAST_LONG_ENTRY */
-        }
-        ent[0]   = (unsigned char)ord;
-        ent[11]  = ATTR_LONG_NAME; /* 0x0F */
-        ent[13]  = sum;            /* LFN checksum must match final short entry */
+        // Clear everything first.
+        memset(lfn_ent, 0, 32);
 
-        /* Copy up to 13 UTF-16 characters from lname[pos..pos+12]. */
+        // Byte [0] = ordinal
+        lfn_ent[0] = (unsigned char)ordinal;
+
+        // Byte [11] = attributes for LFN (0x0F)
+        lfn_ent[11] = 0x0F;
+
+        // Byte [13] = LFN checksum
+        lfn_ent[13] = checksum;
+
+        // Each LFN entry has 13 UTF-16 chars stored in slots:
+        //  - 5 chars at offsets [1..10]
+        //  - 6 chars at offsets [14..25]
+        //  - 2 chars at offsets [28..31]
         for (int j = 0; j < 13; j++) {
+            // Figure out which character to store:
             uint16_t ch;
             int namepos = pos + j;
 
             if (namepos < name_len) {
-                /* Normal character from the string. */
+                // Normal ASCII from the string:
                 ch = (unsigned char)lname[namepos];
             } else if (namepos == name_len) {
-                /* Place a single 0x0000 terminator here. */
+                // Zero terminator:
                 ch = 0;
             } else {
-                /* Beyond end of string => 0xFFFF "unused". */
+                // FFFF => unused slot
                 ch = 0xFFFF;
             }
 
-            /*
-             * Each LFN entry has three chunks for 2-byte chars:
-             *   first 5 chars  => offsets [1..10]
-             *   next  6 chars  => offsets [14..25]
-             *   last  2 chars  => offsets [28..31]
-             */
+            // LFN entry offsets for the jth UTF-16:
             int offset;
-            if      (j < 5)   offset = 1 + (j * 2);
-            else if (j < 11)  offset = 14 + ((j - 5) * 2);
-            else              offset = 28 + ((j - 11) * 2);
+            if      (j < 5)  offset = 1  + j*2;       // [1..10]
+            else if (j < 11) offset = 14 + (j-5)*2;   // [14..25]
+            else             offset = 28 + (j-11)*2;  // [28..31]
 
-            archive_le16enc(ent + offset, ch);
+            // Little-endian UTF-16:
+            lfn_ent[offset]   = (unsigned char)(ch & 0xFF);
+            lfn_ent[offset+1] = (unsigned char)(ch >> 8);
         }
 
-        /* We advance by 13 for the next LFN chunk. */
+        // Advance pos by 13 for the next chunk
         pos += 13;
     }
 }
+
 
 /* ---------------- Directory-Tree Helpers ---------------- */
 
