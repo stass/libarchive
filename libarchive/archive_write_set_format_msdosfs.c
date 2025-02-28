@@ -178,7 +178,6 @@ static struct fat_file* find_or_create_dir(struct msdosfs *msdos,
                                            struct fat_file *parent,
                                            const char *dirname);
 static void add_child_to_parent(struct fat_file *parent, struct fat_file *child);
-static int  count_dir_entries_for_file(struct fat_file *f);
 
 /* Short name logic + collisions. */
 static void init_shortname_hash(struct shortname_hash *hash);
@@ -1229,9 +1228,6 @@ write_fat_tables(struct archive_write *a)
         return ARCHIVE_FATAL;
     }
 
-    /* # of actual FAT entries: cluster_count + 2 reserved. */
-    uint32_t fat_entries = msdos->cluster_count + FAT_RESERVED_ENTRIES;
-
     /* Initialize first 2 entries. */
     if (msdos->fat_type == 12) {
         /* cluster=0 => 0xFF8, cluster=1 => 0xFFF. */
@@ -1454,7 +1450,6 @@ write_data_clusters(struct archive_write *a)
                 /* Pseudocode for a small approach: (omitted for brevity, we do it inline) */
 
                 /* Just do it inline: gather entries => fill in temp array => copy slice. */
-                static const int MAX_DIR_ENTS = 4096; /* for safety */
                 /* 1) collect all items that are direct children => plus '.' + '..'. */
                 /* 2) build LFN + short entry. */
 
@@ -1658,70 +1653,81 @@ write_one_dir_entry(unsigned char *buf, const char shortnm[12],
 
 /* Write the required LFN entries just before the final short entry. */
 static void
-write_longname_entries(unsigned char *buf, const char *lname, const char shortnm[12])
+write_longname_entries(unsigned char *buf, const char *lname,
+                       const char shortnm[12])
 {
+    /* Each LFN directory entry can store 13 UTF-16 chars. */
     int name_len = (int)strlen(lname);
-    int entries_needed = (name_len + 12) / 13; /* each LFN entry can hold 13 UTF-16 chars. */
+    int entries_needed = (name_len + 12) / 13;  /* +12 ensures room for a '\0' if length is multiple of 13 */
 
-    /* Compute the LFN checksum. */
+    /* Compute the LFN checksum from the short (8.3) name. */
     unsigned char sum = 0;
-    for (int i=0; i<11; i++) {
-        sum = (unsigned char)(((sum & 1) ? 0x80 : 0) + (sum >> 1) + (unsigned char)shortnm[i]);
+    for (int i = 0; i < 11; i++) {
+        sum = (unsigned char)(((sum & 1) ? 0x80 : 0) +
+                              (sum >> 1) +
+                              (unsigned char)shortnm[i]);
     }
 
-    /* Build from last to first. */
-    int pos = 0;
+    /*
+     * In your existing loop, the highest ordinal (with 0x40 bit) appears
+     * at buffer offset i=0 (the final iteration), and the lowest ordinal
+     * ends up at the highest offset in memory.  So we track 'pos' from
+     * the start of the string, and each iteration handles the next 13 chars.
+     */
+    int pos = 0;  /* index into lname[] */
+
     for (int i = entries_needed - 1; i >= 0; i--) {
-        unsigned char *ent = buf + i*DIR_ENTRY_SIZE;
+        /* The physical location in the buffer for this LFN chunk: */
+        unsigned char *ent = buf + (i * DIR_ENTRY_SIZE);
+
+        /* Zero this entire 32-byte LFN slot so that cluster fields = 0, etc. */
         memset(ent, 0, DIR_ENTRY_SIZE);
 
+        /*
+         * ord = 1..entries_needed in ascending order.
+         * If ord == entries_needed, set the "last entry" bit (0x40).
+         */
         int ord = entries_needed - i;
         if (ord == entries_needed) {
-            ord |= 0x40; /* last entry marker */
+            ord |= 0x40; /* highest ordinal => LAST_LONG_ENTRY */
         }
-        ent[0] = (unsigned char)ord;
-        ent[11] = ATTR_LONG_NAME;
-        ent[13] = sum;
+        ent[0]   = (unsigned char)ord;
+        ent[11]  = ATTR_LONG_NAME; /* 0x0F */
+        ent[13]  = sum;            /* LFN checksum must match final short entry */
 
-        /* Copy up to 13 UTF-16 chars from lname[pos..pos+12]. */
-        for (int j=0; j<13; j++) {
-            uint16_t ch = 0xFFFF;
+        /* Copy up to 13 UTF-16 characters from lname[pos..pos+12]. */
+        for (int j = 0; j < 13; j++) {
+            uint16_t ch;
             int namepos = pos + j;
+
             if (namepos < name_len) {
+                /* Normal character from the string. */
                 ch = (unsigned char)lname[namepos];
             } else if (namepos == name_len) {
-                ch = 0; /* null terminator */
-            }
-            /* LFN entry has 3 chunks: 5 chars at offset 1, 6 chars at offset 14, 2 chars at offset 28. */
-            int offset;
-            if (j < 5) {
-                offset = 1 + j*2;
-            } else if (j < 11) {
-                offset = 14 + (j-5)*2;
+                /* Place a single 0x0000 terminator here. */
+                ch = 0;
             } else {
-                offset = 28 + (j-11)*2;
+                /* Beyond end of string => 0xFFFF "unused". */
+                ch = 0xFFFF;
             }
+
+            /*
+             * Each LFN entry has three chunks for 2-byte chars:
+             *   first 5 chars  => offsets [1..10]
+             *   next  6 chars  => offsets [14..25]
+             *   last  2 chars  => offsets [28..31]
+             */
+            int offset;
+            if      (j < 5)   offset = 1 + (j * 2);
+            else if (j < 11)  offset = 14 + ((j - 5) * 2);
+            else              offset = 28 + ((j - 11) * 2);
+
             archive_le16enc(ent + offset, ch);
         }
+
+        /* We advance by 13 for the next LFN chunk. */
         pos += 13;
     }
-}
-
-/* Count how many dir entries (including LFN) we would need for this file. */
-static int
-count_dir_entries_for_file(struct fat_file *f)
-{
-    /* If it's a directory or file, we always need at least 1 short entry. If it has a long name that differs from the short name, we need extra. */
-    /* We'll do a naive approach. */
-    if (!f->long_name) return 1;
-    char shortnm[12];
-    make_short_name(f->long_name, shortnm);
-    if (strcmp(f->long_name, shortnm) == 0) {
-        return 1;
-    }
-    int len = (int)strlen(f->long_name);
-    int lfn_count = (len + 12)/13;
-    return (1 + lfn_count);
 }
 
 /* ---------------- Directory-Tree Helpers ---------------- */
