@@ -435,6 +435,10 @@ archive_write_msdosfs_close(struct archive_write *a)
         return r;
     }
 
+    fprintf(stderr, "FAT type: %d, cluster_size=%u, volume_size=%u, fat_size=%u\n",
+            msdos->fat_type, msdos->cluster_size,
+            msdos->volume_size, msdos->fat_size);
+
     /* 2) Assign clusters to each file/directory. */
     r = msdosfs_assign_clusters(a);
     if (r != ARCHIVE_OK) {
@@ -931,6 +935,8 @@ msdosfs_assign_clusters(struct archive_write *a)
             continue;
         }
 
+        DEBUG_PRINT("Trying to assign clusters for '%s'(size=%u)\n",
+                        f->long_name ? f->long_name : "null", f->size);
         if (f->is_dir) {
             /* subdirectory => need enough clusters for f->size. 
              * if f->size>0 => #clusters = (f->size+(cluster_size_bytes-1))/cluster_size_bytes.
@@ -964,6 +970,9 @@ msdosfs_assign_clusters(struct archive_write *a)
                 uint64_t file_bytes = f->size;
                 uint32_t needed = (uint32_t)((file_bytes + cluster_size_bytes -1)/cluster_size_bytes);
                 if (next_cluster + needed -1 > last_cluster) {
+                    DEBUG_PRINT("Unable to assign '%s' clusters %u..%u (count=%u)\n",
+                        f->long_name ? f->long_name : "(null)",
+                        next_cluster, next_cluster + needed, needed);
                     archive_set_error(&a->archive, ENOSPC, 
                                       "Not enough clusters for file");
                     return ARCHIVE_FATAL;
