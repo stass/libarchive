@@ -188,6 +188,75 @@ static int  ensure_unique_short_name(struct archive_write *a, struct msdosfs *ms
                                      char short_name[12], struct fat_file *parent_dir);
 static void make_short_name(const char *long_name, char short_name[12]);
 
+#ifdef MSDOSFS_DEBUG
+static void
+debug_dump_directory_buffer(const unsigned char *dirbuf, size_t total_bytes)
+{
+    fprintf(stderr, "\n[DIR DEBUG] Dumping %zu bytes of directory data:\n", total_bytes);
+
+    // Number of entries:
+    size_t entry_count = total_bytes / 32;
+    for (size_t i = 0; i < entry_count; i++) {
+        const unsigned char *ent = dirbuf + i*32;
+
+        // Byte[0] special checks
+        if (ent[0] == 0x00) {
+            fprintf(stderr, "  Entry #%zu @%zu: END OF DIR (0x00) => no more entries.\n", i, i*32);
+            break; // Typically means end of directory in FAT
+        }
+        if (ent[0] == 0xE5) {
+            fprintf(stderr, "  Entry #%zu @%zu: FREE (0xE5)\n", i, i*32);
+            continue;
+        }
+
+        // Check if it's LFN (attr=0x0F)
+        unsigned char attr = ent[11];
+        if (attr == 0x0F) {
+            // LFN entry
+            unsigned char ord = ent[0];
+            unsigned char chksum = ent[13];
+            fprintf(stderr, "  Entry #%zu @%zu: LFN (ord=0x%02X, chksum=0x%02X)\n",
+                    i, i*32, ord, chksum);
+
+            // Optionally, we can decode some of the UTF-16 characters:
+            // But a quick hex dump may be enough:
+            fprintf(stderr, "     Raw hex:");
+            for (int b = 0; b < 32; b++) {
+                if (b % 8 == 0) fprintf(stderr, "\n     ");
+                fprintf(stderr, " %02X", ent[b]);
+            }
+            fprintf(stderr, "\n");
+        } else {
+            // Must be a normal 8.3 entry
+            char name[12];
+            memcpy(name, ent, 11);
+            name[11] = 0;
+            fprintf(stderr,
+                    "  Entry #%zu @%zu: SHORT [%.11s], attr=0x%02X\n",
+                    i, i*32, name, attr);
+
+            // Also show cluster:
+            unsigned int cluster_lo = (ent[26] | (ent[27] << 8));
+            unsigned int size = (ent[28] | (ent[29] << 8) |
+                                 (ent[30] << 16) | (ent[31] << 24));
+            fprintf(stderr,
+                    "                cluster_lo=%u, size=%u\n",
+                    cluster_lo, size);
+
+            // If FAT32, there's high word at offset[20..21].
+            // We'll just dump them too:
+            fprintf(stderr, "     Raw hex:");
+            for (int b = 0; b < 32; b++) {
+                if (b % 8 == 0) fprintf(stderr, "\n     ");
+                fprintf(stderr, " %02X", ent[b]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    fprintf(stderr, "[DIR DEBUG] End of dump.\n\n");
+}
+#endif
+
 /* --------------------------------------------------------------------
  * Public entry point: set the format to msdosfs (FAT).
  * -------------------------------------------------------------------- */
@@ -1353,6 +1422,7 @@ write_fat12_16_root_dir(struct archive_write *a)
         }
     }
     /* Now write out 'buf' to the archive. */
+    debug_dump_directory_buffer(buf, root_dir_bytes);
     int r = __archive_write_output(a, buf, root_dir_bytes);
     free(buf);
     return r;
@@ -1551,6 +1621,7 @@ write_data_clusters(struct archive_write *a)
                     if (to_copy > cluster_bytes) {
                         to_copy = cluster_bytes;
                     }
+                    debug_dump_directory_buffer(dirbuf + cluster_offset, to_copy);
                     memcpy(tempbuf, dirbuf + cluster_offset, to_copy);
                 }
                 free(dirbuf);
@@ -1654,77 +1725,89 @@ write_one_dir_entry(unsigned char *buf, const char shortnm[12],
 /* Write the required LFN entries just before the final short entry. */
 static void
 write_longname_entries(unsigned char *dirbuf, const char *lname,
-                       const char shortnm[12])
+                             const char shortnm[12])
 {
-    // Number of 13-character LFN entries needed:
     int name_len = (int)strlen(lname);
     int entries_needed = (name_len + 12) / 13;
 
-    // Compute the standard LFN checksum from the short 8.3 name:
+    // Compute the standard FAT LFN checksum from the short 8.3 name:
     unsigned char checksum = 0;
-    for (int i = 0; i < 11; i++)
+    for (int i = 0; i < 11; i++) {
         checksum = (unsigned char)((checksum >> 1) + ((checksum & 1) ? 0x80 : 0) + shortnm[i]);
+    }
 
-    // We'll copy in 13-char chunks from the front to the back of lname,
-    // but physically place them in the directory from last to first.
+    DEBUG_PRINT("\n[LFN DEBUG] Building LFN entries for \"%s\" (length=%d)\n"
+            "            -> total needed: %d\n"
+            "            -> short name: \"%.*s\"\n"
+            "            -> LFN checksum: 0x%02X\n",
+            lname, name_len, entries_needed, 11, shortnm, checksum);
+
+    // We'll copy in 13-char chunks from front to back of lname,
+    // but physically place them in descending order in the directory.
     int pos = 0;  // index into lname
 
     for (int chunk_idx = 0; chunk_idx < entries_needed; chunk_idx++) {
-        // This LFN ordinal is 1..N in ascending order:
+        // ordinal = 1..N in ascending order
         int ordinal = chunk_idx + 1;
-        // If it's the last chunk, set 0x40:
+        // If it's the last chunk, set 0x40
         if (ordinal == entries_needed)
             ordinal |= 0x40;
 
-        // Physically, chunk N (ordinal = N | 0x40) goes at offset 0,
-        // chunk N-1 at offset 32, etc.
-        unsigned char *lfn_ent =
-            dirbuf + (entries_needed - 1 - chunk_idx) * 32;
+        // The physical offset in dirbuf:
+        size_t entry_offset = (entries_needed - 1 - chunk_idx) * 32;
+        unsigned char *lfn_ent = dirbuf + entry_offset;
 
-        // Clear everything first.
+        // Clear everything first
         memset(lfn_ent, 0, 32);
 
         // Byte [0] = ordinal
         lfn_ent[0] = (unsigned char)ordinal;
-
-        // Byte [11] = attributes for LFN (0x0F)
+        // Byte [11] = attributes = 0x0F (LFN)
         lfn_ent[11] = 0x0F;
-
         // Byte [13] = LFN checksum
         lfn_ent[13] = checksum;
 
-        // Each LFN entry has 13 UTF-16 chars stored in slots:
-        //  - 5 chars at offsets [1..10]
-        //  - 6 chars at offsets [14..25]
-        //  - 2 chars at offsets [28..31]
+        DEBUG_PRINT("[LFN DEBUG]  Writing chunk #%d (ordinal=0x%02X) at dirbuf[%zu..%zu]",
+                chunk_idx + 1, (unsigned int)lfn_ent[0], entry_offset, entry_offset + 31);
+
+        // Copy up to 13 characters from lname[pos..pos+12]
         for (int j = 0; j < 13; j++) {
-            // Figure out which character to store:
             uint16_t ch;
             int namepos = pos + j;
 
             if (namepos < name_len) {
-                // Normal ASCII from the string:
                 ch = (unsigned char)lname[namepos];
             } else if (namepos == name_len) {
-                // Zero terminator:
+                // zero terminator
                 ch = 0;
             } else {
-                // FFFF => unused slot
+                // 0xFFFF for unused
                 ch = 0xFFFF;
             }
 
-            // LFN entry offsets for the jth UTF-16:
+            // In an LFN entry, the 13 UTF-16 chars go to these offsets:
+            //  j=0..4   -> [1..10]
+            //  j=5..10  -> [14..25]
+            //  j=11..12 -> [28..31]
             int offset;
-            if      (j < 5)  offset = 1  + j*2;       // [1..10]
-            else if (j < 11) offset = 14 + (j-5)*2;   // [14..25]
-            else             offset = 28 + (j-11)*2;  // [28..31]
+            if      (j < 5)  offset = 1 + j*2;       // [1..10]
+            else if (j < 11) offset = 14 + (j-5)*2;  // [14..25]
+            else             offset = 28 + (j-11)*2; // [28..31]
 
-            // Little-endian UTF-16:
+            // Store as little-endian UTF-16
             lfn_ent[offset]   = (unsigned char)(ch & 0xFF);
             lfn_ent[offset+1] = (unsigned char)(ch >> 8);
         }
 
-        // Advance pos by 13 for the next chunk
+        // We'll print out the actual substring we just copied:
+        int chunk_count = (name_len - pos);
+        if (chunk_count > 13) chunk_count = 13;
+        DEBUG_PRINT("             -> substring: \"%.*s\" (pos=%d..%d)",
+                chunk_count > 0 ? chunk_count : 0,
+                (chunk_count > 0) ? (lname + pos) : "",
+                pos, pos + chunk_count - 1);
+
+        // Advance pos by 13 for next chunk
         pos += 13;
     }
 }
