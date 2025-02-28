@@ -666,20 +666,15 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
              * Actually, let's start with a guess based on total file size. 
              */
             uint64_t total_file_bytes = 0;
+            uint64_t total_dir_bytes = 0;
             for (struct fat_file *f = msdos->files; f; f=f->next) {
-                if (!f->is_dir) {
-                    total_file_bytes += f->size;
-                }
-            }
-            /* We'll guess how many clusters we might need. 
-             * This is somewhat an over-approx if we want to handle big subdirs. 
-             * For subdirectories, we might guess each directory uses at least 1 cluster. 
-             */
-            int dir_count = 0;
-            for (struct fat_file *f=msdos->files; f; f=f->next) {
-                if (f->is_dir && !(f->is_root && (fat_type==12||fat_type==16))) {
-                    /* (FAT12/16 root doesn't consume clusters. FAT32 root does.) */
-                    dir_count++;
+                if (f->is_dir) {
+                 // For FAT12/16 root, f->is_root => does *not* consume clusters
+                   if (! (f->is_root && (fat_type == 12 || fat_type == 16))) {
+                     total_dir_bytes += f->size;  // subdirectory size
+                  }
+                } else {
+                     total_file_bytes += f->size;     // regular file
                 }
             }
 
@@ -687,7 +682,8 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
             uint64_t cbytes = (uint64_t)csize * SECTOR_SIZE;
             uint64_t needed_clusters_for_files =
                (total_file_bytes + cbytes -1)/cbytes;
-            uint64_t approx_clusters = needed_clusters_for_files + dir_count + 16;
+            uint64_t needed_clusters_for_dirs = (total_dir_bytes + cbytes - 1) / cbytes;
+            uint64_t approx_clusters = needed_clusters_for_files + needed_clusters_for_dirs + 120;
 
             /* Let's pick volume_size initially as big enough for that many clusters 
              * plus overhead. We'll do a guess for the FAT. We'll override with try_fat_size. 
@@ -1677,7 +1673,7 @@ write_longname_entries(unsigned char *buf, const char *lname, const char shortnm
     int pos = 0;
     for (int i = entries_needed - 1; i >= 0; i--) {
         unsigned char *ent = buf + i*DIR_ENTRY_SIZE;
-        memset(ent, 0xFF, DIR_ENTRY_SIZE);
+        memset(ent, 0, DIR_ENTRY_SIZE);
 
         int ord = entries_needed - i;
         if (ord == entries_needed) {
