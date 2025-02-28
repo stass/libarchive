@@ -429,8 +429,6 @@ archive_write_msdosfs_close(struct archive_write *a)
 {
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
 
-    debug_print_files(a);
-
     /* 1) Compute minimal geometry to hold all directories & files. */
     int r = msdosfs_compute_geometry(a);
     if (r != ARCHIVE_OK) {
@@ -442,6 +440,8 @@ archive_write_msdosfs_close(struct archive_write *a)
     if (r != ARCHIVE_OK) {
         return r;
     }
+
+    debug_print_files(a);
 
     /* 3) Stream out the final disk image directly to libarchive. */
     r = msdosfs_write_disk_image(a);
@@ -895,14 +895,10 @@ msdosfs_assign_clusters(struct archive_write *a)
         }
         if (root_dir) {
             /* compute how many clusters are needed. */
-            uint64_t s = (root_dir->size == 0) ? 0 : root_dir->size;
+            uint64_t s = root_dir->size;
             uint32_t needed = (uint32_t)((s + cluster_size_bytes -1)/cluster_size_bytes);
-            if (needed==0 && s>0) {
+            if (needed==0) {
                 needed=1;
-            } else if (s==0) {
-                /* If user wants empty root => we can do 0 or 1 cluster. 
-                 * Some tools require at least 1 cluster.  Let’s do 1 if s>0. 
-                 */
             }
 
             if (needed>0) {
@@ -977,6 +973,9 @@ msdosfs_assign_clusters(struct archive_write *a)
                 next_cluster += needed;
             }
         }
+                    DEBUG_PRINT("Assigning '%s' clusters %u..%u (count=%u)\n",
+                        f->long_name ? f->long_name : "(null)",
+                        f->first_cluster, f->first_cluster + f->cluster_count, f->cluster_count);
     }
 
     /* If we get here => success. */
@@ -1084,15 +1083,13 @@ write_boot_sector(struct archive_write *a)
     bpb->sec_per_clus = (uint8_t)msdos->cluster_size;
     archive_le16enc(&bpb->rsvd_sec_cnt, (uint16_t)msdos->reserved_sectors);
     bpb->num_fats = 2;
-    archive_le16enc(&bpb->root_ent_cnt, (uint16_t)msdos->root_entries);
 
-    /* tot_sec16 if <65536 else use tot_sec32. */
-    if (msdos->volume_size < 65536) {
-        archive_le16enc(&bpb->tot_sec16, (uint16_t)msdos->volume_size);
-        archive_le32enc(&bpb->tot_sec32, 0);
-    } else {
+    if (msdos->fat_type == 32 || msdos->volume_size >= 65536) {
         archive_le16enc(&bpb->tot_sec16, 0);
         archive_le32enc(&bpb->tot_sec32, msdos->volume_size);
+    } else {
+        archive_le16enc(&bpb->tot_sec16, (uint16_t)msdos->volume_size);
+        archive_le32enc(&bpb->tot_sec32, 0);
     }
     bpb->media = 0xF8; /* fixed disk */
     archive_le16enc(&bpb->sec_per_trk, 63);
@@ -1122,6 +1119,7 @@ write_boot_sector(struct archive_write *a)
         memcpy(bsx->vol_lab, "NO NAME    ", 11);
         memcpy(bsx->fil_sys_type, "FAT32   ", 8);
     } else {
+    	archive_le16enc(&bpb->root_ent_cnt, (uint16_t)msdos->root_entries);
         archive_le16enc(&bpb->fat_sz16, (uint16_t)msdos->fat_size);
         /* The DOS extension for FAT12/16 is at offset 36. */
         struct bs_ext *bsx = (struct bs_ext *)(sector + 36);
@@ -1254,6 +1252,10 @@ write_fat_tables(struct archive_write *a)
         }
         uint32_t start = f->first_cluster;
         uint32_t end   = start + f->cluster_count - 1;
+
+                DEBUG_PRINT("FAT linking '%s' chain from %u..%u\n",
+                    f->long_name ? f->long_name : "(null)", start, end);
+
         for (uint32_t c = start; c <= end; c++) {
             uint32_t nextval = 0;
             if (c < end) {
@@ -1267,6 +1269,9 @@ write_fat_tables(struct archive_write *a)
                 } else {
                     nextval = 0x0FFFFFFF;
                 }
+            }
+            if (c > (msdos->cluster_count + 1)) {
+                DEBUG_PRINT("WARNING: cluster %u is beyond last valid cluster!\n", c);
             }
             if (msdos->fat_type == 12) {
                 fat12_set_entry(fat, c, (uint16_t)nextval);
@@ -1410,8 +1415,12 @@ write_data_clusters(struct archive_write *a)
         return ARCHIVE_FATAL;
     }
 
-    for (uint32_t c = FAT_RESERVED_ENTRIES; c < (total_clusters + FAT_RESERVED_ENTRIES); c++) {
+    for (uint32_t c = FAT_RESERVED_ENTRIES; c < total_clusters; c++) {
         struct cluster_info *ci = &map[c];
+        if (c > total_clusters) {
+            DEBUG_PRINT("Cluster %u out of range!\n", c);
+            break;
+        }
         if (!ci->owner) {
             /* Unused cluster => write zero. */
             memset(tempbuf, 0, cluster_bytes);
