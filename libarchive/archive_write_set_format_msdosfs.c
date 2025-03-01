@@ -1233,9 +1233,8 @@ write_boot_sector(struct archive_write *a)
         memset(fsinfo, 0, SECTOR_SIZE);
         archive_le32enc(fsinfo + 0, 0x41615252);
         archive_le32enc(fsinfo + 484, 0x61417272);
-        /* We could store the "free cluster count" here, but to keep it simple:
-         * 0xFFFFFFFF => unknown free. But let's do a minimal placeholder. */
-        archive_le32enc(fsinfo + 488, msdos->cluster_count - 1); /* free clusters (rough) */
+        /* According to MS -- we can write 0xffffffff (unknown) here and let OS do the calculation on first mount. */
+        archive_le32enc(fsinfo + 488, 0xffffffff);
         archive_le32enc(fsinfo + 492, 2); /* next free cluster? */
         archive_le32enc(fsinfo + 508, 0xAA550000);
         r = __archive_write_output(a, fsinfo, SECTOR_SIZE);
