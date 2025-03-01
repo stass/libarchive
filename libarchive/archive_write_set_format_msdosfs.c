@@ -100,6 +100,7 @@ struct fat_file {
     off_t    content_offset;
 
     /* Additional fields could go here if needed. */
+    char short_name[12];  /* 8.3 short name, null-terminated */
 };
 
 /* For detecting short-name collisions, we keep a hash of used names per directory. */
@@ -410,6 +411,14 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
     }
 
     free(dup_path);
+
+    // Generate and ensure unique short name here
+    make_short_name(file->long_name, file->short_name);
+    if (ensure_unique_short_name(a, msdos, file->short_name, parent_dir) != 0) {
+        free(file->long_name);
+        free(file);
+        return ARCHIVE_FATAL;
+    }
 
     /* Set up parent, link into parent's child list. */
     file->parent = parent_dir;
@@ -1391,15 +1400,8 @@ write_fat12_16_root_dir(struct archive_write *a)
     struct fat_file *f;
     for (f = msdos->files; f; f = f->next) {
         if (f->parent == NULL && !f->is_root) {
-            /* We'll build an entry for this item. Possibly plus LFN entries. */
-            char shortnm[12];
-            make_short_name(f->long_name, shortnm);
-            if (ensure_unique_short_name(a, msdos, shortnm, NULL) != 0) {
-                free(buf);
-                return ARCHIVE_FATAL;
-            }
             /* If the long name differs, write LFN. */
-            if (f->long_name && strcmp(f->long_name, shortnm) != 0) {
+            if (f->long_name && strcmp(f->long_name, f->short_name) != 0) {
                 int lfn_count = (int)((strlen(f->long_name)+12)/13);
                 size_t lfn_bytes = lfn_count * DIR_ENTRY_SIZE;
                 if (offset + lfn_bytes + DIR_ENTRY_SIZE > root_dir_bytes) {
@@ -1408,7 +1410,7 @@ write_fat12_16_root_dir(struct archive_write *a)
                     return ARCHIVE_FATAL;
                 }
                 /* Write LFN entries. */
-                write_longname_entries(buf + offset, f->long_name, shortnm);
+                write_longname_entries(buf + offset, f->long_name, f->short_name);
                 offset += lfn_bytes;
             }
             /* Then the final 32-byte short entry. */
@@ -1417,7 +1419,7 @@ write_fat12_16_root_dir(struct archive_write *a)
                 archive_set_error(&a->archive, ENOSPC, "Root directory overflow");
                 return ARCHIVE_FATAL;
             }
-            write_one_dir_entry(buf + offset, shortnm, f, msdos->fat_type);
+            write_one_dir_entry(buf + offset, f->short_name, f, msdos->fat_type);
             offset += DIR_ENTRY_SIZE;
         }
     }
@@ -1588,26 +1590,18 @@ write_data_clusters(struct archive_write *a)
                 /* Then each child => same approach as we did for the root. */
                 struct fat_file *c = owner->children;
                 while (c) {
-                    char shortnm[12];
-                    make_short_name(c->long_name, shortnm);
-                    if (ensure_unique_short_name(a, msdos, shortnm, owner) != 0) {
-                        free(dirbuf);
-                        free(tempbuf);
-                        free(map);
-                        return ARCHIVE_FATAL;
-                    }
                     /* Possibly LFN. */
-                    if (c->long_name && strcmp(c->long_name, shortnm) != 0) {
+                    if (c->long_name && strcmp(c->long_name, c->short_name) != 0) {
                         int lfn_count = (int)((strlen(c->long_name)+12)/13);
                         size_t lfn_bytes = (size_t)lfn_count * DIR_ENTRY_SIZE;
                         if (off + lfn_bytes + DIR_ENTRY_SIZE > dir_size) {
                             /* truncated? oh well. in real code we'd check. */
                         }
-                        write_longname_entries(dirbuf + off, c->long_name, shortnm);
+                        write_longname_entries(dirbuf + off, c->long_name, c->short_name);
                         off += lfn_bytes;
                     }
                     if (off + DIR_ENTRY_SIZE <= dir_size) {
-                        write_one_dir_entry(dirbuf + off, shortnm, c, msdos->fat_type);
+                        write_one_dir_entry(dirbuf + off, c->short_name, c, msdos->fat_type);
                         off += DIR_ENTRY_SIZE;
                     }
                     c = c->sibling;
@@ -1735,6 +1729,7 @@ write_longname_entries(unsigned char *dirbuf, const char *lname,
     for (int i = 0; i < 11; i++) {
         checksum = (unsigned char)((checksum >> 1) + ((checksum & 1) ? 0x80 : 0) + shortnm[i]);
     }
+    DEBUG_PRINT("Computed checksum for %.11s: 0x%02x", shortnm, checksum);
 
     DEBUG_PRINT("\n[LFN DEBUG] Building LFN entries for \"%s\" (length=%d)\n"
             "            -> total needed: %d\n"
