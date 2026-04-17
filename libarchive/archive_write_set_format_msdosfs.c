@@ -1,17 +1,39 @@
 /*-
+ * Copyright (c) 2024-2026 Stanislav Sedov <stas@deglitch.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*-
  * archive_write_set_format_msdosfs.c
  *
- * Revised "msdosfs" (FAT) format writer for libarchive implementing
+ * msdosfs (FAT) format writer for libarchive implementing
  * two-pass creation:
  *
  *   Pass 1 = Collect file data in temp file.
- *            Build an in-memory file/dir tree (msdos->files).
- *   Pass 2 = Compute minimal FAT geometry & cluster assignments,
- *            then write the entire FAT disk image *directly*
- *            to libarchive’s final output stream.
+ *   Pass 2 = Build a minimal FAT geometry & cluster assignments,
+ *            then write the entire FAT disk image to libarchive’s
+ *            final output stream.
  *
- * The temp file only stores file contents; no FAT metadata is
- * ever overwritten into that temp file. Metadata is built in memory.
  */
 
 #include "archive_platform.h"
@@ -39,14 +61,12 @@
 #include "archive_private.h"
 #include "archive_write_private.h"
 
-/* Debug macros */
-#define MSDOSFS_DEBUG
+/* Debug macros -- uncomment to enable verbose debug output to stderr. */
+/* #define MSDOSFS_DEBUG */
 #ifdef MSDOSFS_DEBUG
 #define DEBUG_PRINT(fmt, ...)  fprintf(stderr, "MSDOSFS: " fmt "\n", ##__VA_ARGS__)
-static void debug_print_files(struct archive_write *a);
 #else
 #define DEBUG_PRINT(fmt, ...)
-static void debug_print_files(struct archive_write *a) { (void)a; }
 #endif
 
 /* 512-byte sectors. */
@@ -146,8 +166,6 @@ struct msdosfs {
     /* For a FAT32 root directory node, if needed. (is_root=1 + is_dir=1) */
     struct fat_file *fat32_root;
 };
-
-/* --------------------- Forward Declarations ----------------------- */
 
 /* The mandatory format callbacks: */
 static int  archive_write_msdosfs_options(struct archive_write *a, const char *key, const char *val);
@@ -256,11 +274,18 @@ debug_dump_directory_buffer(const unsigned char *dirbuf, size_t total_bytes)
     }
     fprintf(stderr, "[DIR DEBUG] End of dump.\n\n");
 }
+#else
+static void
+debug_dump_directory_buffer(const unsigned char *dirbuf, size_t total_bytes)
+{
+    (void)dirbuf;
+    (void)total_bytes;
+}
 #endif
 
-/* --------------------------------------------------------------------
+/*
  * Public entry point: set the format to msdosfs (FAT).
- * -------------------------------------------------------------------- */
+ */
 int
 archive_write_set_format_msdosfs(struct archive *_a)
 {
@@ -280,7 +305,7 @@ archive_write_set_format_msdosfs(struct archive *_a)
     /* By default, let fat_type=0 => auto-detect (12/16/32) once we see total size. */
     msdos->fat_type = 0;
 
-    /* For FAT12/16, a default root_entries. We'll refine it later. */
+    /* For FAT12/16, a default root_entries. We'll recalculate it later. */
     msdos->root_entries = 512; 
 
     /* Create the temp file (to store file data in pass #1). */
@@ -306,9 +331,9 @@ archive_write_set_format_msdosfs(struct archive *_a)
     return ARCHIVE_OK;
 }
 
-/* --------------------------------------------------------------------
+/*
  * Implement user-specified options (e.g. "fat_type=12|16|32").
- * -------------------------------------------------------------------- */
+ */
 static int
 archive_write_msdosfs_options(struct archive_write *a, const char *key, const char *val)
 {
@@ -328,12 +353,12 @@ archive_write_msdosfs_options(struct archive_write *a, const char *key, const ch
     return ARCHIVE_WARN;
 }
 
-/* --------------------------------------------------------------------
+/*
  * Pass 1: archive_write_header => new file/dir is about to be written.
  * We create a new fat_file, parse its path into parent dirs, etc.
  * For directories, no data is written. For files, we remember content_offset
  * in the temp file.
- * -------------------------------------------------------------------- */
+ */
 static int
 archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entry)
 {
@@ -430,7 +455,6 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
     file->next = msdos->files;
     msdos->files = file;
 
-    /* If it's a file, get ready for data. */
     if (!file->is_dir) {
         msdos->current_file = file;
         msdos->bytes_remaining = file->size;
@@ -442,10 +466,10 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
     return ARCHIVE_OK;
 }
 
-/* --------------------------------------------------------------------
+/*
  * Pass 1: archive_write_data => write a data block for the *current_file*.
  * Simply write this block to the temp file.
- * -------------------------------------------------------------------- */
+ */
 static ssize_t
 archive_write_msdosfs_data(struct archive_write *a, const void *buff, size_t s)
 {
@@ -469,10 +493,10 @@ archive_write_msdosfs_data(struct archive_write *a, const void *buff, size_t s)
     return w;
 }
 
-/* --------------------------------------------------------------------
+/*
  * Pass 1: archive_write_finish_entry => finalize this entry.
- * If the announced size was bigger than what we got, zero‐pad in the temp file.
- * -------------------------------------------------------------------- */
+ * Pad the file with zeros as needed.
+ */
 static int
 archive_write_msdosfs_finish_entry(struct archive_write *a)
 {
@@ -496,11 +520,10 @@ archive_write_msdosfs_finish_entry(struct archive_write *a)
     return ARCHIVE_OK;
 }
 
-/* --------------------------------------------------------------------
- * Pass 2: archive_write_msdosfs_close => now that all entries are in,
- * we compute the minimal FAT geometry, assign clusters, and do a single
+/*
+ * Pass 2: compute the minimal FAT geometry, assign clusters, and do a single
  * streaming write of the complete FAT filesystem structure to the archive.
- * -------------------------------------------------------------------- */
+ */
 static int
 archive_write_msdosfs_close(struct archive_write *a)
 {
@@ -512,7 +535,7 @@ archive_write_msdosfs_close(struct archive_write *a)
         return r;
     }
 
-    fprintf(stderr, "FAT type: %d, cluster_size=%u, volume_size=%u, fat_size=%u\n",
+    DEBUG_PRINT("FAT type: %d, cluster_size=%u, volume_size=%u, fat_size=%u",
             msdos->fat_type, msdos->cluster_size,
             msdos->volume_size, msdos->fat_size);
 
@@ -522,7 +545,7 @@ archive_write_msdosfs_close(struct archive_write *a)
         return r;
     }
 
-    debug_print_files(a);
+    DEBUG_PRINT("Cluster assignment complete");
 
     /* 3) Stream out the final disk image directly to libarchive. */
     r = msdosfs_write_disk_image(a);
@@ -536,9 +559,6 @@ archive_write_msdosfs_close(struct archive_write *a)
     return ARCHIVE_OK;
 }
 
-/* --------------------------------------------------------------------
- * Free the msdosfs object entirely.
- * -------------------------------------------------------------------- */
 static int
 archive_write_msdosfs_free(struct archive_write *a)
 {
@@ -570,15 +590,12 @@ archive_write_msdosfs_free(struct archive_write *a)
 
 /* ======================= PASS 2: Compute Geometry ======================= */
 
-/* 
- * Forward references for these helpers:
- */
 static void compute_directory_sizes(struct msdosfs *msdos);
 static uint32_t count_needed_dir_entries(struct fat_file *dir);
 static int try_fat_geometry(struct archive_write *a, int fat_type,
                             uint32_t *out_cluster_size);
 
-/* ----------------------------------------------------------------------
+/*
  * msdosfs_compute_geometry():
  *
  *  - Figures out whether to use FAT12, FAT16, or FAT32,
@@ -599,7 +616,7 @@ static int try_fat_geometry(struct archive_write *a, int fat_type,
  * 
  * On success: returns ARCHIVE_OK; geometry fields are set.
  * On failure: returns ARCHIVE_FATAL with an error message in a->archive.
- * ---------------------------------------------------------------------- */
+ */
 static int
 msdosfs_compute_geometry(struct archive_write *a)
 {
@@ -674,9 +691,6 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
     int n_candidates = (int)(sizeof(cluster_candidates)/sizeof(cluster_candidates[0]));
 
     /* Precompute how many top-level items we might need in the root if FAT12/16. */
-    /* We'll see if we need to enlarge msdos->root_entries. The user might have 
-     * some default. We'll do it here. 
-     */
     if (fat_type==12 || fat_type==16) {
         /* Count how many top-level files/dirs are parent==NULL. */
         int count_top = 0;
@@ -685,7 +699,7 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
                 count_top += count_needed_dir_entries(f);
             }
         }
-        /* If that’s bigger than msdos->root_entries, enlarge a bit. */
+        /* If that’s bigger than msdos->root_entries, enlarge it a bit. */
         if (count_top > (int)msdos->root_entries) {
             msdos->root_entries = (uint32_t)(count_top + 16);
         }
@@ -703,7 +717,6 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
         msdos->fat_type = fat_type;
         msdos->cluster_size = csize;
 
-        /* For FAT32, typically 32 reserved sectors. For FAT12/16 => 1 reserved sector. */
         if (fat_type == 32) {
             msdos->reserved_sectors = 32;
         } else {
@@ -719,7 +732,7 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
         }
 
         /* We do an iterative approach to fix up the FAT size. 
-         * Because the FAT size depends on cluster_count, which depends on 
+         * The challenge here is that the FAT size depends on cluster_count, which depends on 
          * volume_size - (reserved+2*fat_size+root_size)/cluster_size. 
          */
         uint32_t try_fat_size = 1; 
@@ -738,10 +751,7 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
              * If new_fat_size != try_fat_size, we update and loop again.
              */
 
-            /* We'll guess some large volume_size to ensure we don't run out, 
-             * then we will refine or confirm. 
-             * Actually, let's start with a guess based on total file size. 
-             */
+             /* Start with a guess based on total file size. */
             uint64_t total_file_bytes = 0;
             uint64_t total_dir_bytes = 0;
             for (struct fat_file *f = msdos->files; f; f=f->next) {
@@ -858,7 +868,7 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
     return ARCHIVE_FATAL;
 }
 
-/* ----------------------------------------------------------------------
+/*
  * compute_directory_sizes():
  *   For each directory in msdos->files, compute how many bytes are needed
  *   to store its directory entries (including LFN if used).  We place
@@ -871,14 +881,12 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
  *   Implementation details:
  *     - Each directory needs 2 entries for "." and "..".
  *     - Each child file/dir might need 1 short entry + LFN entries.
- *     - The function count_needed_dir_entries() calculates the total for
- *       that file or directory.  Summing up each child yields total entries.
  *     - Then f->size = num_entries * 32.
  * 
  * Note that for the FAT12/16 root directory, we do NOT set f->size; instead
  * it’s limited by msdos->root_entries.  Only subdirectories get cluster-based
  * storage.
- * ---------------------------------------------------------------------- */
+ */
 static void
 compute_directory_sizes(struct msdosfs *msdos)
 {
@@ -907,7 +915,7 @@ compute_directory_sizes(struct msdosfs *msdos)
     }
 }
 
-/* ----------------------------------------------------------------------
+/*
  * count_needed_dir_entries(f): 
  *   returns how many 32-byte directory entries are needed for this file
  *   or directory, including short+LFN.  Typically 1 short entry if the
@@ -915,7 +923,7 @@ compute_directory_sizes(struct msdosfs *msdos)
  * 
  *   If f is a directory, we do not add the 2 extra for "." and ".." here,
  *   that is handled by the parent’s calculation. 
- * ---------------------------------------------------------------------- */
+ */
 static uint32_t
 count_needed_dir_entries(struct fat_file *f)
 {
@@ -937,7 +945,7 @@ count_needed_dir_entries(struct fat_file *f)
     }
 }
 
-/* ----------------------------------------------------------------------
+/*
  * msdosfs_assign_clusters():
  *
  *  - For FAT12/16, the “root directory” is a fixed region, so it gets
@@ -949,7 +957,7 @@ count_needed_dir_entries(struct fat_file *f)
  *    we force at least 1.
  *  - For files, if size>0, allocate enough clusters.  Zero-length => 0.
  *  - If we ever run out of cluster_count, we fail with “Not enough clusters for file”.
- * ---------------------------------------------------------------------- */
+ */
 static int
 msdosfs_assign_clusters(struct archive_write *a)
 {
@@ -967,8 +975,31 @@ msdosfs_assign_clusters(struct archive_write *a)
     if (msdos->fat_type == 32) {
         struct fat_file *root_dir = msdos->fat32_root;
         if (!root_dir) {
-            /* if truly no root => create one just so we have it. */
-            /* though typically you’d have done that earlier. */
+            /* FAT32 was auto-detected; create the root node now
+             * and re-parent all top-level files under it. */
+            root_dir = (struct fat_file *)calloc(1, sizeof(*root_dir));
+            if (!root_dir) {
+                archive_set_error(&a->archive, ENOMEM,
+                    "Cannot allocate FAT32 root dir");
+                return ARCHIVE_FATAL;
+            }
+            root_dir->is_dir  = 1;
+            root_dir->is_root = 1;
+            root_dir->long_name = strdup("FAT32_ROOT");
+            root_dir->next = msdos->files;
+            msdos->files = root_dir;
+            msdos->fat32_root = root_dir;
+
+            /* Re-parent top-level files under the new root. */
+            for (struct fat_file *f = msdos->files; f; f = f->next) {
+                if (f != root_dir && !f->is_root && f->parent == NULL) {
+                    f->parent = root_dir;
+                    add_child_to_parent(root_dir, f);
+                }
+            }
+
+            /* Recompute directory sizes with the new root. */
+            compute_directory_sizes(msdos);
         }
         if (root_dir) {
             /* compute how many clusters are needed. */
@@ -1075,10 +1106,6 @@ msdosfs_assign_clusters(struct archive_write *a)
  *      - If cluster belongs to a subdir, build that subdir in memory, output it
  *      - If cluster belongs to a file, read from temp file
  *      - If cluster is free (not assigned), output zeros
- *
- * All these writes go directly to libarchive via __archive_write_output(...).
- * We do *not* write these items into the temp file. The temp file is only used
- * to read file contents from.
  */
 static int
 msdosfs_write_disk_image(struct archive_write *a)
@@ -1110,7 +1137,6 @@ msdosfs_write_disk_image(struct archive_write *a)
 /* ------------------- 1) Boot Sector & FSInfo  ------------------- */
 
 /* Minimal helper for building boot sector in memory. */
-#pragma pack(push,1)
 /* Standard DOS 8‐byte jump + OEM, then a BPB. We unify for FAT12/16/32. */
 struct bpb_common {
     uint8_t  jmp[3];      /* 0xEB, +2 bytes, e.g. 0xEB 0x58 0x90 */
@@ -1128,7 +1154,7 @@ struct bpb_common {
     uint16_t num_heads;
     uint32_t hid_sec;
     uint32_t tot_sec32;
-};
+} __attribute__ ((packed));
 struct bpb_fat32 {
     uint32_t fat_sz32;
     uint16_t ext_flags;
@@ -1137,7 +1163,7 @@ struct bpb_fat32 {
     uint16_t fs_info;
     uint16_t bk_boot_sec;
     uint8_t  reserved[12];
-};
+} __attribute__ ((packed));
 struct bs_ext {
     uint8_t  drv_num;
     uint8_t  reserved1;
@@ -1145,8 +1171,7 @@ struct bs_ext {
     uint32_t vol_id;
     uint8_t  vol_lab[11];
     uint8_t  fil_sys_type[8];
-};
-#pragma pack(pop)
+} __attribute__ ((packed));
 
 static int
 write_boot_sector(struct archive_write *a)
@@ -1233,9 +1258,30 @@ write_boot_sector(struct archive_write *a)
         memset(fsinfo, 0, SECTOR_SIZE);
         archive_le32enc(fsinfo + 0, 0x41615252);
         archive_le32enc(fsinfo + 484, 0x61417272);
-        /* According to MS -- we can write 0xffffffff (unknown) here and let OS do the calculation on first mount. */
-        archive_le32enc(fsinfo + 488, 0xffffffff);
-        archive_le32enc(fsinfo + 492, 2); /* next free cluster? */
+
+        /* Compute total allocated clusters */
+        uint32_t used_clusters = 0;
+        uint32_t last_allocated = 2; /* Default: FAT32 root cluster */
+        struct fat_file *f;
+
+        for (f = msdos->files; f; f = f->next) {
+            used_clusters += f->cluster_count;
+            if (f->cluster_count > 0) {
+                uint32_t end_cluster = f->first_cluster + f->cluster_count - 1;
+                if (end_cluster > last_allocated) {
+                    last_allocated = end_cluster;
+                }
+            }
+        }
+
+        /* Compute free clusters */
+        uint32_t data_clusters = msdos->cluster_count;
+        uint32_t free_clusters = (data_clusters > used_clusters) ? (data_clusters - used_clusters) : 0;
+
+        /* Put that in FSInfo offset[488..491]: */
+        archive_le32enc(fsinfo + 488, free_clusters);
+
+        archive_le32enc(fsinfo + 492, last_allocated); /* next free cluster? */
         archive_le32enc(fsinfo + 508, 0xAA550000);
         r = __archive_write_output(a, fsinfo, SECTOR_SIZE);
         if (r != ARCHIVE_OK) return r;
@@ -1487,137 +1533,113 @@ write_data_clusters(struct archive_write *a)
         return ARCHIVE_FATAL;
     }
 
-    for (uint32_t c = FAT_RESERVED_ENTRIES; c < total_clusters; c++) {
+    /* Cache for directory data: avoid rebuilding for every cluster
+     * of a multi-cluster directory.  Clusters for each directory are
+     * contiguous, so we build once and reuse. */
+    struct fat_file *cached_dir_owner = NULL;
+    unsigned char *cached_dirbuf = NULL;
+    size_t cached_dir_size = 0;
+
+    for (uint32_t c = FAT_RESERVED_ENTRIES; c < FAT_RESERVED_ENTRIES + total_clusters; c++) {
         struct cluster_info *ci = &map[c];
-        if (c > total_clusters) {
-            DEBUG_PRINT("Cluster %u out of range!\n", c);
-            break;
-        }
         if (!ci->owner) {
             /* Unused cluster => write zero. */
             memset(tempbuf, 0, cluster_bytes);
         } else {
-            /* Owned by a file or a directory? */
             struct fat_file *owner = ci->owner;
             if (owner->is_dir) {
-                /* Build directory contents for cluster ci->index_in_file. 
-                 * Typically, we only have 1 or a few clusters. We'll do a
-                 * helper that builds the entire directory data once (since
-                 * we have owner->size). Then we pick the slice for the cluster. 
-                 */
                 memset(tempbuf, 0, cluster_bytes);
 
-                /* The simplest approach: build the entire directory in memory the first time we see cluster_index=0,
-                 * store it in a small cache. Or we can build it on-demand each time. 
-                 * For brevity, let's do a quick approach: build the entire directory once if not already done, store
-                 * it in owner->some_buffer. Then copy out the chunk for this cluster. 
-                 *
-                 * We'll show a small inline approach. 
-                 */
-                /* We'll do a static function "build_directory_data(owner)" that returns a buffer of length = owner->size. 
-                 * We'll store it in a dynamic pointer. If owner->size < cluster_bytes * owner->cluster_count, the remainder is zero. 
-                 * Then we copy out the relevant slice. 
-                 */
-                /* Pseudocode for a small approach: (omitted for brevity, we do it inline) */
-
-                /* Just do it inline: gather entries => fill in temp array => copy slice. */
-                /* 1) collect all items that are direct children => plus '.' + '..'. */
-                /* 2) build LFN + short entry. */
-
-                /* We'll do a minimal approach here: if index_in_file=0, build. Then reuse. */
-                /* This sample code might be quite large; you can factor it out if needed. */
-
-                if (!owner->entry) {
-                    /* Use a hidden pointer trick or a cached buffer. For a demonstration, we'll do an inline build each time. */
-                }
-
-                /* Actually let's store it in 'tempbuf' only if index_in_file=0. We'll do the entire directory at once. 
-                 * But if directory spans multiple clusters, we have to output each cluster. We do that by offset = ci->index_in_file * cluster_bytes.
-                 */
-                size_t dir_size = owner->size;
-                if (dir_size == 0 && owner->is_dir) {
-                    dir_size = DIR_ENTRY_SIZE * 2; /* "." + ".." */
-                }
-                unsigned char *dirbuf = (unsigned char*)calloc(1, dir_size);
-                if (!dirbuf) {
-                    free(tempbuf);
-                    free(map);
-                    archive_set_error(&a->archive, ENOMEM, "No memory for subdir build");
-                    return ARCHIVE_FATAL;
-                }
-                /* Build subdir entries: 
-                 * index 0 => '.' => shortname ".          "
-                 * index 1 => '..' => shortname "..         "
-                 * then each child. Possibly LFN, etc.
-                 */
-                size_t off = 0;
-
-                /* "." => references the dir itself. */
-                {
-                    char dotname[11] = ".          ";
-                    write_one_dir_entry(dirbuf + off, dotname, owner, msdos->fat_type);
-                    off += DIR_ENTRY_SIZE;
-                }
-                /* ".." => references owner->parent. (In FAT32, if parent is the root with cluster=0, that's special.)
-                 * If this subdir's parent is the FAT32 root, then we typically set the ".." cluster=0 or the parent's cluster?
-                 * For simplicity here, we'll pass a "dummy" with cluster=0 for the root. 
-                 */
-                {
-                    char dotdot[11] = "..         ";
-                    struct fat_file dummy_parent = {0};
-                    struct fat_file *p = owner->parent;
-                    if (msdos->fat_type == 32 && p && p->is_root) {
-                        /* special case => cluster=0 for FAT32 root's '..' from subdir of root. */
-                        dummy_parent.is_dir = 1;
-                        dummy_parent.first_cluster = 0;
-                        write_one_dir_entry(dirbuf + off, dotdot, &dummy_parent, msdos->fat_type);
-                    } else if (!p && (msdos->fat_type ==12||msdos->fat_type==16)) {
-                        /* subdir of the FAT12/16 root => root has cluster=0 => that's correct. */
-                        dummy_parent.is_dir = 1;
-                        dummy_parent.first_cluster = 0;
-                        write_one_dir_entry(dirbuf + off, dotdot, &dummy_parent, msdos->fat_type);
-                    } else if (p) {
-                        write_one_dir_entry(dirbuf + off, dotdot, p, msdos->fat_type);
-                    } else {
-                        /* No parent => top-level subdir? Not typical for FAT12/16, but oh well. */
-                        dummy_parent.is_dir = 1;
-                        dummy_parent.first_cluster = 0;
-                        write_one_dir_entry(dirbuf + off, dotdot, &dummy_parent, msdos->fat_type);
+                /* Build directory data once per directory, cache it. */
+                if (owner != cached_dir_owner) {
+                    free(cached_dirbuf);
+                    cached_dir_size = owner->size;
+                    if (cached_dir_size == 0)
+                        cached_dir_size = DIR_ENTRY_SIZE * 2;
+                    cached_dirbuf = (unsigned char*)calloc(1, cached_dir_size);
+                    if (!cached_dirbuf) {
+                        free(tempbuf);
+                        free(map);
+                        archive_set_error(&a->archive, ENOMEM,
+                            "No memory for subdir build");
+                        return ARCHIVE_FATAL;
                     }
-                    off += DIR_ENTRY_SIZE;
-                }
-                /* Then each child => same approach as we did for the root. */
-                struct fat_file *c = owner->children;
-                while (c) {
-                    /* Possibly LFN. */
-                    if (c->long_name && strcmp(c->long_name, c->short_name) != 0) {
-                        int lfn_count = (int)((strlen(c->long_name)+12)/13);
-                        size_t lfn_bytes = (size_t)lfn_count * DIR_ENTRY_SIZE;
-                        if (off + lfn_bytes + DIR_ENTRY_SIZE > dir_size) {
-                            /* truncated? oh well. in real code we'd check. */
-                        }
-                        write_longname_entries(dirbuf + off, c->long_name, c->short_name);
-                        off += lfn_bytes;
-                    }
-                    if (off + DIR_ENTRY_SIZE <= dir_size) {
-                        write_one_dir_entry(dirbuf + off, c->short_name, c, msdos->fat_type);
+                    cached_dir_owner = owner;
+
+                    size_t off = 0;
+
+                    /* "." entry. */
+                    {
+                        char dotname[11] = ".          ";
+                        write_one_dir_entry(cached_dirbuf + off, dotname,
+                            owner, msdos->fat_type);
                         off += DIR_ENTRY_SIZE;
                     }
-                    c = c->sibling;
+                    /* ".." entry. */
+                    {
+                        char dotdot[11] = "..         ";
+                        struct fat_file dummy_parent = {0};
+                        struct fat_file *p = owner->parent;
+                        if (msdos->fat_type == 32 && p && p->is_root) {
+                            dummy_parent.is_dir = 1;
+                            dummy_parent.first_cluster = 0;
+                            write_one_dir_entry(cached_dirbuf + off, dotdot,
+                                &dummy_parent, msdos->fat_type);
+                        } else if (!p && (msdos->fat_type == 12 ||
+                            msdos->fat_type == 16)) {
+                            dummy_parent.is_dir = 1;
+                            dummy_parent.first_cluster = 0;
+                            write_one_dir_entry(cached_dirbuf + off, dotdot,
+                                &dummy_parent, msdos->fat_type);
+                        } else if (p) {
+                            write_one_dir_entry(cached_dirbuf + off, dotdot,
+                                p, msdos->fat_type);
+                        } else {
+                            dummy_parent.is_dir = 1;
+                            dummy_parent.first_cluster = 0;
+                            write_one_dir_entry(cached_dirbuf + off, dotdot,
+                                &dummy_parent, msdos->fat_type);
+                        }
+                        off += DIR_ENTRY_SIZE;
+                    }
+                    /* Child entries. */
+                    {
+                        struct fat_file *ch = owner->children;
+                        while (ch) {
+                            if (ch->long_name &&
+                                strcmp(ch->long_name, ch->short_name) != 0) {
+                                int lfn_count =
+                                    (int)((strlen(ch->long_name) + 12) / 13);
+                                size_t lfn_bytes =
+                                    (size_t)lfn_count * DIR_ENTRY_SIZE;
+                                if (off + lfn_bytes + DIR_ENTRY_SIZE <=
+                                    cached_dir_size) {
+                                    write_longname_entries(
+                                        cached_dirbuf + off,
+                                        ch->long_name, ch->short_name);
+                                    off += lfn_bytes;
+                                }
+                            }
+                            if (off + DIR_ENTRY_SIZE <= cached_dir_size) {
+                                write_one_dir_entry(cached_dirbuf + off,
+                                    ch->short_name, ch, msdos->fat_type);
+                                off += DIR_ENTRY_SIZE;
+                            }
+                            ch = ch->sibling;
+                        }
+                    }
+                    debug_dump_directory_buffer(cached_dirbuf, cached_dir_size);
                 }
 
-                /* Now copy out the chunk for this cluster index. */
-                size_t cluster_offset = (size_t)ci->index_in_file * cluster_bytes;
-                memset(tempbuf, 0, cluster_bytes);
-                if (cluster_offset < dir_size) {
-                    size_t to_copy = dir_size - cluster_offset;
-                    if (to_copy > cluster_bytes) {
+                /* Copy out the slice for this cluster. */
+                size_t cluster_offset =
+                    (size_t)ci->index_in_file * cluster_bytes;
+                if (cluster_offset < cached_dir_size) {
+                    size_t to_copy = cached_dir_size - cluster_offset;
+                    if (to_copy > cluster_bytes)
                         to_copy = cluster_bytes;
-                    }
-                    debug_dump_directory_buffer(dirbuf + cluster_offset, to_copy);
-                    memcpy(tempbuf, dirbuf + cluster_offset, to_copy);
+                    memcpy(tempbuf, cached_dirbuf + cluster_offset, to_copy);
                 }
-                free(dirbuf);
 
             } else {
                 /* It's a file. We read from the temp file. */
@@ -1632,6 +1654,7 @@ write_data_clusters(struct archive_write *a)
                  * If the file was smaller, we zero‐padded in the temp file’s pass #1 anyway. So we can just read cluster_bytes. 
                  */
                 if (lseek(msdos->temp_fd, read_off, SEEK_SET) < 0) {
+                    free(cached_dirbuf);
                     free(tempbuf);
                     free(map);
                     archive_set_error(&a->archive, errno, "lseek failed reading file data");
@@ -1641,6 +1664,7 @@ write_data_clusters(struct archive_write *a)
                 while (got < to_read) {
                     ssize_t rd = read(msdos->temp_fd, tempbuf + got, to_read - got);
                     if (rd < 0) {
+                        free(cached_dirbuf);
                         free(tempbuf);
                         free(map);
                         archive_set_error(&a->archive, errno, "Error reading temp file data");
@@ -1657,12 +1681,14 @@ write_data_clusters(struct archive_write *a)
         /* Write cluster data out. */
         int ret = __archive_write_output(a, tempbuf, cluster_bytes);
         if (ret != ARCHIVE_OK) {
+            free(cached_dirbuf);
             free(tempbuf);
             free(map);
             return ret;
         }
     }
 
+    free(cached_dirbuf);
     free(tempbuf);
     free(map);
     return ARCHIVE_OK;

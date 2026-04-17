@@ -1087,7 +1087,7 @@ static const char *long_help_msg =
 	"Create: %p -c [options] [<file> | <dir> | @<archive> | -C <dir> ]\n"
 	"  <file>, <dir>  add these items to archive\n"
 	"  -z, -j, -J, --lzma  Compress archive with gzip/bzip2/xz/lzma\n"
-	"  --format {ustar|pax|cpio|shar}  Select archive format\n"
+	"  --format {ustar|pax|cpio|shar|msdosfs}  Select archive format\n"
 	"  --exclude <pattern>  Skip files that match pattern\n"
 	"  --mtime <date>  Set modification times for added files\n"
 	"  --clamp-mtime   Only set modification times for files newer than --mtime\n"
