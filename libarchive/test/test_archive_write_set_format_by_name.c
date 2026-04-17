@@ -196,6 +196,14 @@ DEFINE_TEST(test_archive_write_set_format_by_name_iso9660)
 	    NULL, 0);
 }
 
+DEFINE_TEST(test_archive_write_set_format_by_name_msdosfs)
+{
+	/* No read support for FAT, so use format_id=-1 to skip read-back.
+	 * Boot sector starts with jump 0xEB. */
+	test_format_by_name("msdosfs", NULL, -1, 0,
+	    "\xEB\x3C\x90", 3);
+}
+
 DEFINE_TEST(test_archive_write_set_format_by_name_mtree)
 {
 	test_format_by_name("mtree", NULL, ARCHIVE_FORMAT_MTREE, 2, NULL, 0);
