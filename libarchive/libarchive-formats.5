@@ -452,6 +452,31 @@ format archives.
 TODO: Need more information.
 .Ss LHA
 TODO: Information about libarchive's LHA support
+.Ss MS-DOS FAT Disk Images
+Libarchive can write MS-DOS FAT filesystem images in FAT12, FAT16,
+and FAT32 formats.
+These are complete disk images containing a FAT filesystem, not
+streaming archive formats.
+All entries are collected before the image is written.
+.Pp
+The format can be selected as
+.Dq msdosfs ,
+.Dq fat ,
+or
+.Dq fat32 .
+.Pp
+Supported write options:
+.Bl -tag -width indent
+.It Cm fat_type
+Force FAT type: 12, 16, or 32.
+If not specified, the smallest suitable type is chosen automatically.
+.It Cm volume_label
+Set the volume label, up to 11 characters.
+.It Cm volume_id
+Set the volume serial number (32-bit integer).
+.It Cm cluster_size
+Override the cluster size in sectors per cluster (power of 2, 1\(en128).
+.El
 .Ss RAR
 Libarchive has limited support for reading RAR format archives.
 Currently, libarchive can read RARv3 format archives
