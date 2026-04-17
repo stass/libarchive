@@ -59,6 +59,7 @@
 #include "archive_entry.h"
 #include "archive_endian.h"
 #include "archive_private.h"
+#include "archive_string.h"
 #include "archive_write_private.h"
 
 /* Debug macros -- uncomment to enable verbose debug output to stderr. */
@@ -74,7 +75,9 @@
 
 /* FAT12 limit ~4084 clusters; FAT16 limit ~65524. */
 #define FAT12_MAX_CLUSTERS  4084
+#define FAT16_MIN_CLUSTERS  4085
 #define FAT16_MAX_CLUSTERS  65524
+#define FAT32_MIN_CLUSTERS  65525
 /* 32-bit FAT uses up to ~2^28 clusters, but we rarely get that big. */
 
 /* The first 2 cluster entries in the FAT are reserved. */
@@ -91,6 +94,20 @@
 #define ATTR_DIRECTORY  0x10
 #define ATTR_ARCHIVE    0x20
 #define ATTR_LONG_NAME  (ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID)
+
+/* FSInfo sector signature offsets and values (FAT32). */
+#define FSINFO_SIG1_OFF     0
+#define FSINFO_SIG1_VAL     0x41615252
+#define FSINFO_SIG2_OFF     484
+#define FSINFO_SIG2_VAL     0x61417272
+#define FSINFO_FREE_OFF     488
+#define FSINFO_NEXT_OFF     492
+#define FSINFO_TRAIL_OFF    508
+#define FSINFO_TRAIL_VAL    0xAA550000
+
+/* Default CHS geometry for BPB. */
+#define BPB_SEC_PER_TRK     63
+#define BPB_NUM_HEADS       255
 
 /* A single file or directory in this FAT image. */
 struct fat_file {
@@ -115,6 +132,8 @@ struct fat_file {
 
     /* Name strings. */
     char    *long_name;        /* full path component or fallback. */
+    uint8_t *utf16name;        /* long_name converted to UTF-16LE. */
+    size_t   utf16name_len;    /* byte length of utf16name. */
 
     /* Where file data is stored in the temp file (for files). */
     off_t    content_offset;
@@ -138,6 +157,10 @@ struct shortname_hash {
 struct msdosfs {
     /* Options / user selections: */
     int  fat_type;             /* 12, 16, 32, or 0 for 'auto' */
+    char volume_label[12];     /* 11 chars + NUL */
+    uint32_t volume_id;        /* volume serial number */
+    int  volume_id_set;        /* non-zero if user explicitly set volume_id */
+    int  cluster_size_override;/* 0 = auto, else sectors per cluster */
     /* Computed geometry: */
     uint32_t volume_size;      /* total sectors in the volume */
     uint32_t reserved_sectors;
@@ -165,6 +188,10 @@ struct msdosfs {
 
     /* For a FAT32 root directory node, if needed. (is_root=1 + is_dir=1) */
     struct fat_file *fat32_root;
+
+    /* String converter for UTF-8 to UTF-16LE (for LFN entries). */
+    struct archive_string_conv *sconv_to_utf16;
+    struct archive_string utf16buf;
 };
 
 /* The mandatory format callbacks: */
@@ -189,11 +216,12 @@ static int  write_data_clusters(struct archive_write *a);
 /* Directory-entry build helpers: */
 static void write_one_dir_entry(unsigned char *buf, const char shortnm[12],
                                 const struct fat_file *f, int fat_type);
-static void write_longname_entries(unsigned char *buf, const char *lname,
-                                   const char shortnm[12]);
+static void write_longname_entries(unsigned char *buf, const uint8_t *u16name,
+                                   size_t u16len, const char shortnm[12]);
 
 /* Directory and short-name utilities: */
-static struct fat_file* find_or_create_dir(struct msdosfs *msdos,
+static struct fat_file* find_or_create_dir(struct archive_write *a,
+                                           struct msdosfs *msdos,
                                            struct fat_file *parent,
                                            const char *dirname);
 static void add_child_to_parent(struct fat_file *parent, struct fat_file *child);
@@ -202,75 +230,59 @@ static void add_child_to_parent(struct fat_file *parent, struct fat_file *child)
 static void init_shortname_hash(struct shortname_hash *hash);
 static unsigned int shortname_hash_key(const char *name, struct fat_file *parent_dir);
 static int  shortname_exists(struct msdosfs *msdos, const char *name, struct fat_file *parent_dir);
-static void add_shortname(struct msdosfs *msdos, const char *name, struct fat_file *parent_dir);
+static int  add_shortname(struct msdosfs *msdos, const char *name, struct fat_file *parent_dir);
 static int  ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos,
                                      char short_name[12], struct fat_file *parent_dir);
 static void make_short_name(const char *long_name, char short_name[12]);
+static int  convert_name_to_utf16(struct archive_write *a, struct msdosfs *msdos,
+                                  struct fat_file *f);
 
 #ifdef MSDOSFS_DEBUG
 static void
 debug_dump_directory_buffer(const unsigned char *dirbuf, size_t total_bytes)
 {
-    fprintf(stderr, "\n[DIR DEBUG] Dumping %zu bytes of directory data:\n", total_bytes);
-
-    // Number of entries:
     size_t entry_count = total_bytes / 32;
-    for (size_t i = 0; i < entry_count; i++) {
-        const unsigned char *ent = dirbuf + i*32;
+    size_t i;
 
-        // Byte[0] special checks
+    fprintf(stderr, "\n[DIR DEBUG] Dumping %zu bytes of directory data:\n",
+        total_bytes);
+
+    for (i = 0; i < entry_count; i++) {
+        const unsigned char *ent = dirbuf + i * 32;
+        unsigned char attr;
+        int b;
+
         if (ent[0] == 0x00) {
-            fprintf(stderr, "  Entry #%zu @%zu: END OF DIR (0x00) => no more entries.\n", i, i*32);
-            break; // Typically means end of directory in FAT
+            fprintf(stderr,
+                "  Entry #%zu @%zu: END OF DIR (0x00)\n", i, i * 32);
+            break;
         }
         if (ent[0] == 0xE5) {
-            fprintf(stderr, "  Entry #%zu @%zu: FREE (0xE5)\n", i, i*32);
+            fprintf(stderr,
+                "  Entry #%zu @%zu: FREE (0xE5)\n", i, i * 32);
             continue;
         }
 
-        // Check if it's LFN (attr=0x0F)
-        unsigned char attr = ent[11];
+        attr = ent[11];
         if (attr == 0x0F) {
-            // LFN entry
-            unsigned char ord = ent[0];
-            unsigned char chksum = ent[13];
-            fprintf(stderr, "  Entry #%zu @%zu: LFN (ord=0x%02X, chksum=0x%02X)\n",
-                    i, i*32, ord, chksum);
-
-            // Optionally, we can decode some of the UTF-16 characters:
-            // But a quick hex dump may be enough:
-            fprintf(stderr, "     Raw hex:");
-            for (int b = 0; b < 32; b++) {
-                if (b % 8 == 0) fprintf(stderr, "\n     ");
-                fprintf(stderr, " %02X", ent[b]);
-            }
-            fprintf(stderr, "\n");
+            fprintf(stderr,
+                "  Entry #%zu @%zu: LFN (ord=0x%02X, chksum=0x%02X)\n",
+                i, i * 32, ent[0], ent[13]);
         } else {
-            // Must be a normal 8.3 entry
-            char name[12];
-            memcpy(name, ent, 11);
-            name[11] = 0;
+            unsigned int cluster_lo = ent[26] | (ent[27] << 8);
+            unsigned int size = ent[28] | (ent[29] << 8) |
+                (ent[30] << 16) | (ent[31] << 24);
             fprintf(stderr,
-                    "  Entry #%zu @%zu: SHORT [%.11s], attr=0x%02X\n",
-                    i, i*32, name, attr);
-
-            // Also show cluster:
-            unsigned int cluster_lo = (ent[26] | (ent[27] << 8));
-            unsigned int size = (ent[28] | (ent[29] << 8) |
-                                 (ent[30] << 16) | (ent[31] << 24));
-            fprintf(stderr,
-                    "                cluster_lo=%u, size=%u\n",
-                    cluster_lo, size);
-
-            // If FAT32, there's high word at offset[20..21].
-            // We'll just dump them too:
-            fprintf(stderr, "     Raw hex:");
-            for (int b = 0; b < 32; b++) {
-                if (b % 8 == 0) fprintf(stderr, "\n     ");
-                fprintf(stderr, " %02X", ent[b]);
-            }
-            fprintf(stderr, "\n");
+                "  Entry #%zu @%zu: SHORT [%.11s] attr=0x%02X "
+                "cluster=%u size=%u\n",
+                i, i * 32, (const char *)ent, attr, cluster_lo, size);
         }
+        fprintf(stderr, "     Raw hex:");
+        for (b = 0; b < 32; b++) {
+            if (b % 8 == 0) fprintf(stderr, "\n     ");
+            fprintf(stderr, " %02X", ent[b]);
+        }
+        fprintf(stderr, "\n");
     }
     fprintf(stderr, "[DIR DEBUG] End of dump.\n\n");
 }
@@ -305,6 +317,13 @@ archive_write_set_format_msdosfs(struct archive *_a)
     /* By default, let fat_type=0 => auto-detect (12/16/32) once we see total size. */
     msdos->fat_type = 0;
 
+    /* Default volume label and ID. */
+    memcpy(msdos->volume_label, "NO NAME    ", 11);
+    msdos->volume_label[11] = '\0';
+    msdos->volume_id = 0;
+    msdos->volume_id_set = 0;
+    msdos->cluster_size_override = 0;
+
     /* For FAT12/16, a default root_entries. We'll recalculate it later. */
     msdos->root_entries = 512; 
 
@@ -328,7 +347,10 @@ archive_write_set_format_msdosfs(struct archive *_a)
     a->format_close          = archive_write_msdosfs_close;
     a->format_free           = archive_write_msdosfs_free;
 
-    return ARCHIVE_OK;
+    a->archive.archive_format = ARCHIVE_FORMAT_MSDOSFS;
+    a->archive.archive_format_name = "MSDOSFS";
+
+    return (ARCHIVE_OK);
 }
 
 /*
@@ -338,19 +360,65 @@ static int
 archive_write_msdosfs_options(struct archive_write *a, const char *key, const char *val)
 {
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
+
     if (strcmp(key, "fat_type") == 0) {
         int t = atoi(val);
         if (t != 12 && t != 16 && t != 32) {
             archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-                              "Invalid FAT type %d (must be 12, 16, or 32)", t);
+                "Invalid FAT type %d (must be 12, 16, or 32)", t);
             return (ARCHIVE_FATAL);
         }
         msdos->fat_type = t;
-        return ARCHIVE_OK;
+        return (ARCHIVE_OK);
+    }
+    if (strcmp(key, "volume_label") == 0 || strcmp(key, "volume-label") == 0) {
+        size_t len, i;
+        if (val == NULL)
+            val = "";
+        len = strlen(val);
+        if (len > 11)
+            len = 11;
+        memset(msdos->volume_label, ' ', 11);
+        msdos->volume_label[11] = '\0';
+        for (i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)val[i];
+            if (c >= 'a' && c <= 'z')
+                c -= 32;
+            msdos->volume_label[i] = c;
+        }
+        return (ARCHIVE_OK);
+    }
+    if (strcmp(key, "volume_id") == 0 || strcmp(key, "volume-id") == 0) {
+        char *end;
+        unsigned long id;
+        if (val == NULL || *val == '\0') {
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                "volume_id requires a value");
+            return (ARCHIVE_FATAL);
+        }
+        id = strtoul(val, &end, 0);
+        if (*end != '\0') {
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                "Invalid volume_id: %s", val);
+            return (ARCHIVE_FATAL);
+        }
+        msdos->volume_id = (uint32_t)id;
+        msdos->volume_id_set = 1;
+        return (ARCHIVE_OK);
+    }
+    if (strcmp(key, "cluster_size") == 0 || strcmp(key, "cluster-size") == 0) {
+        int cs = atoi(val);
+        if (cs < 1 || cs > 128 || (cs & (cs - 1)) != 0) {
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                "cluster_size must be a power of 2 between 1 and 128");
+            return (ARCHIVE_FATAL);
+        }
+        msdos->cluster_size_override = cs;
+        return (ARCHIVE_OK);
     }
 
     /* If unrecognized, return warning. */
-    return ARCHIVE_WARN;
+    return (ARCHIVE_WARN);
 }
 
 /*
@@ -375,17 +443,27 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
         return ARCHIVE_FATAL;
     }
     file->entry   = archive_entry_clone(entry);
-    file->size    = (uint32_t)archive_entry_size(entry);
     file->is_dir  = (archive_entry_filetype(entry) == AE_IFDIR);
+
+    /* FAT max file size is 4GB - 1. */
+    if (!file->is_dir && archive_entry_size(entry) > (int64_t)UINT32_MAX) {
+        archive_entry_free(file->entry);
+        free(file);
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+            "File too large for FAT filesystem (max 4GB)");
+        return (ARCHIVE_FAILED);
+    }
+    file->size = (uint32_t)archive_entry_size(entry);
 
     /* For FAT32, we keep a single special root node if needed. Create it once. */
     if (msdos->fat_type == 32 && msdos->fat32_root == NULL) {
         /* Create the FAT32 root directory node. */
         struct fat_file *root = (struct fat_file *)calloc(1, sizeof(*root));
         if (!root) {
+            archive_entry_free(file->entry);
             free(file);
             archive_set_error(&a->archive, ENOMEM, "Cannot allocate FAT32 root dir");
-            return ARCHIVE_FATAL;
+            return (ARCHIVE_FATAL);
         }
         root->is_dir   = 1;
         root->is_root  = 1;
@@ -398,9 +476,10 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
     /* Duplicate the path for splitting. */
     char *dup_path = strdup(pathname);
     if (!dup_path) {
+        archive_entry_free(file->entry);
         free(file);
         archive_set_error(&a->archive, ENOMEM, "strdup failed");
-        return ARCHIVE_FATAL;
+        return (ARCHIVE_FATAL);
     }
 
     /* Starting parent depends on if we have FAT32 root or not. */
@@ -418,7 +497,15 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
         char *next = strtok_r(NULL, "/", &brk);
         if (next) {
             /* This 'token' is an intermediate directory. */
-            parent_dir = find_or_create_dir(msdos, parent_dir, token);
+            parent_dir = find_or_create_dir(a, msdos, parent_dir, token);
+            if (parent_dir == NULL) {
+                archive_entry_free(file->entry);
+                free(file);
+                free(dup_path);
+                archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                    "Failed to create intermediate directory");
+                return (ARCHIVE_FATAL);
+            }
         } else {
             /* This is the final component. */
             last_component = token;
@@ -437,12 +524,21 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
 
     free(dup_path);
 
-    // Generate and ensure unique short name here
+    /* Generate and ensure unique short name. */
     make_short_name(file->long_name, file->short_name);
     if (ensure_unique_short_name(a, msdos, file->short_name, parent_dir) != 0) {
+        archive_entry_free(file->entry);
         free(file->long_name);
         free(file);
-        return ARCHIVE_FATAL;
+        return (ARCHIVE_FATAL);
+    }
+
+    /* Convert name to UTF-16LE for LFN entries. */
+    if (convert_name_to_utf16(a, msdos, file) != ARCHIVE_OK) {
+        archive_entry_free(file->entry);
+        free(file->long_name);
+        free(file);
+        return (ARCHIVE_FATAL);
     }
 
     /* Set up parent, link into parent's child list. */
@@ -536,8 +632,8 @@ archive_write_msdosfs_close(struct archive_write *a)
     }
 
     DEBUG_PRINT("FAT type: %d, cluster_size=%u, volume_size=%u, fat_size=%u",
-            msdos->fat_type, msdos->cluster_size,
-            msdos->volume_size, msdos->fat_size);
+        msdos->fat_type, msdos->cluster_size,
+        msdos->volume_size, msdos->fat_size);
 
     /* 2) Assign clusters to each file/directory. */
     r = msdosfs_assign_clusters(a);
@@ -579,9 +675,11 @@ archive_write_msdosfs_free(struct archive_write *a)
             struct fat_file *nx = f->next;
             if (f->entry) archive_entry_free(f->entry);
             free(f->long_name);
+            free(f->utf16name);
             free(f);
             f = nx;
         }
+        archive_string_free(&msdos->utf16buf);
         free(msdos);
         a->format_data = NULL;
     }
@@ -709,9 +807,14 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
         msdos->root_size    = 0;
     }
 
-    /* Now we attempt each cluster size in ascending order. */
+    /* Now we attempt each cluster size in ascending order.
+     * If the user specified a cluster_size_override, try only that. */
     for (int j=0; j<n_candidates; j++) {
         uint32_t csize = cluster_candidates[j];
+        if (msdos->cluster_size_override > 0) {
+            csize = (uint32_t)msdos->cluster_size_override;
+            j = n_candidates; /* exit after this iteration */
+        }
 
         /* Set up initial fields: */
         msdos->fat_type = fat_type;
@@ -754,14 +857,13 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
              /* Start with a guess based on total file size. */
             uint64_t total_file_bytes = 0;
             uint64_t total_dir_bytes = 0;
-            for (struct fat_file *f = msdos->files; f; f=f->next) {
+            for (struct fat_file *f = msdos->files; f; f = f->next) {
                 if (f->is_dir) {
-                 // For FAT12/16 root, f->is_root => does *not* consume clusters
-                   if (! (f->is_root && (fat_type == 12 || fat_type == 16))) {
-                     total_dir_bytes += f->size;  // subdirectory size
-                  }
+                    /* FAT12/16 root (is_root) does not consume clusters. */
+                    if (!(f->is_root && (fat_type == 12 || fat_type == 16)))
+                        total_dir_bytes += f->size;
                 } else {
-                     total_file_bytes += f->size;     // regular file
+                    total_file_bytes += f->size;
                 }
             }
 
@@ -771,6 +873,14 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
                (total_file_bytes + cbytes -1)/cbytes;
             uint64_t needed_clusters_for_dirs = (total_dir_bytes + cbytes - 1) / cbytes;
             uint64_t approx_clusters = needed_clusters_for_files + needed_clusters_for_dirs + 120;
+
+            /* Enforce minimum cluster counts per FAT type so that
+             * external tools (which determine FAT type by cluster
+             * count, per the MS spec) agree with our format. */
+            if (fat_type == 16 && approx_clusters < FAT16_MIN_CLUSTERS)
+                approx_clusters = FAT16_MIN_CLUSTERS;
+            if (fat_type == 32 && approx_clusters < FAT32_MIN_CLUSTERS)
+                approx_clusters = FAT32_MIN_CLUSTERS;
 
             /* Let's pick volume_size initially as big enough for that many clusters 
              * plus overhead. We'll do a guess for the FAT. We'll override with try_fat_size. 
@@ -927,20 +1037,25 @@ compute_directory_sizes(struct msdosfs *msdos)
 static uint32_t
 count_needed_dir_entries(struct fat_file *f)
 {
-    /* Basic approach: 1 short entry.  If f->long_name is different from 
-     * the short name, add # of LFN entries => (len(long_name)+12)/13.
+    /* 1 short entry.  If long_name differs from the short name,
+     * add LFN entries based on the UTF-16 character count.
+     * Each LFN entry holds 13 UTF-16 code units.
      */
-    if (!f->long_name) {
-        return 1;
+    if (!f->long_name)
+        return (1);
+    /* If the long name matches the short name, no LFN needed. */
+    if (strcmp(f->long_name, f->short_name) == 0)
+        return (1);
+    /* Use UTF-16 code unit count (2 bytes each) for LFN calculation. */
+    if (f->utf16name != NULL && f->utf16name_len > 0) {
+        size_t u16chars = f->utf16name_len / 2;
+        uint32_t lfn_count = (uint32_t)((u16chars + 12) / 13);
+        return (1 + lfn_count);
     }
-    /* generate the short name in a buffer and compare. */
-    char shortnm[12];
-    make_short_name(f->long_name, shortnm);
-    if (strcmp(f->long_name, shortnm)==0) {
-        return 1;
-    } else {
+    /* Fallback: use byte length (correct for ASCII). */
+    {
         size_t len = strlen(f->long_name);
-        uint32_t lfn_count = (uint32_t)((len+12)/13);
+        uint32_t lfn_count = (uint32_t)((len + 12) / 13);
         return (1 + lfn_count);
     }
 }
@@ -1178,9 +1293,17 @@ write_boot_sector(struct archive_write *a)
 {
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
     unsigned char sector[SECTOR_SIZE];
-    memset(sector, 0, SECTOR_SIZE);
+    uint32_t vol_id;
+    struct bpb_common *bpb;
 
-    struct bpb_common *bpb = (struct bpb_common *)sector;
+    /* Generate volume ID if not explicitly set. */
+    if (msdos->volume_id_set)
+        vol_id = msdos->volume_id;
+    else
+        vol_id = (uint32_t)time(NULL);
+
+    memset(sector, 0, SECTOR_SIZE);
+    bpb = (struct bpb_common *)sector;
     bpb->jmp[0] = 0xEB;  /* short jmp */
     bpb->jmp[1] = 0x3C;
     bpb->jmp[2] = 0x90;
@@ -1199,8 +1322,8 @@ write_boot_sector(struct archive_write *a)
         archive_le32enc(&bpb->tot_sec32, 0);
     }
     bpb->media = 0xF8; /* fixed disk */
-    archive_le16enc(&bpb->sec_per_trk, 63);
-    archive_le16enc(&bpb->num_heads, 255);
+    archive_le16enc(&bpb->sec_per_trk, BPB_SEC_PER_TRK);
+    archive_le16enc(&bpb->num_heads, BPB_NUM_HEADS);
     archive_le32enc(&bpb->hid_sec, 0);
 
     /* For FAT12/16, store fat_sz16 in bpb; for FAT32, store in bpb_fat32. */
@@ -1222,8 +1345,8 @@ write_boot_sector(struct archive_write *a)
         bsx->drv_num = 0x80;
         bsx->reserved1 = 0;
         bsx->boot_sig = 0x29;
-        archive_le32enc(&bsx->vol_id, 0x12345678);
-        memcpy(bsx->vol_lab, "NO NAME    ", 11);
+        archive_le32enc(&bsx->vol_id, vol_id);
+        memcpy(bsx->vol_lab, msdos->volume_label, 11);
         memcpy(bsx->fil_sys_type, "FAT32   ", 8);
     } else {
     	archive_le16enc(&bpb->root_ent_cnt, (uint16_t)msdos->root_entries);
@@ -1233,8 +1356,8 @@ write_boot_sector(struct archive_write *a)
         bsx->drv_num = 0x80;
         bsx->reserved1 = 0;
         bsx->boot_sig = 0x29;
-        archive_le32enc(&bsx->vol_id, 0x12345678);
-        memcpy(bsx->vol_lab, "NO NAME    ", 11);
+        archive_le32enc(&bsx->vol_id, vol_id);
+        memcpy(bsx->vol_lab, msdos->volume_label, 11);
         if (msdos->fat_type == 16)
             memcpy(bsx->fil_sys_type, "FAT16   ", 8);
         else
@@ -1256,10 +1379,10 @@ write_boot_sector(struct archive_write *a)
         /* FSInfo sector. */
         unsigned char fsinfo[SECTOR_SIZE];
         memset(fsinfo, 0, SECTOR_SIZE);
-        archive_le32enc(fsinfo + 0, 0x41615252);
-        archive_le32enc(fsinfo + 484, 0x61417272);
+        archive_le32enc(fsinfo + FSINFO_SIG1_OFF, FSINFO_SIG1_VAL);
+        archive_le32enc(fsinfo + FSINFO_SIG2_OFF, FSINFO_SIG2_VAL);
 
-        /* Compute total allocated clusters */
+        /* Compute total allocated clusters. */
         uint32_t used_clusters = 0;
         uint32_t last_allocated = 2; /* Default: FAT32 root cluster */
         struct fat_file *f;
@@ -1268,21 +1391,19 @@ write_boot_sector(struct archive_write *a)
             used_clusters += f->cluster_count;
             if (f->cluster_count > 0) {
                 uint32_t end_cluster = f->first_cluster + f->cluster_count - 1;
-                if (end_cluster > last_allocated) {
+                if (end_cluster > last_allocated)
                     last_allocated = end_cluster;
-                }
             }
         }
 
-        /* Compute free clusters */
+        /* Compute free clusters. */
         uint32_t data_clusters = msdos->cluster_count;
-        uint32_t free_clusters = (data_clusters > used_clusters) ? (data_clusters - used_clusters) : 0;
+        uint32_t free_clusters = (data_clusters > used_clusters) ?
+            (data_clusters - used_clusters) : 0;
 
-        /* Put that in FSInfo offset[488..491]: */
-        archive_le32enc(fsinfo + 488, free_clusters);
-
-        archive_le32enc(fsinfo + 492, last_allocated); /* next free cluster? */
-        archive_le32enc(fsinfo + 508, 0xAA550000);
+        archive_le32enc(fsinfo + FSINFO_FREE_OFF, free_clusters);
+        archive_le32enc(fsinfo + FSINFO_NEXT_OFF, last_allocated);
+        archive_le32enc(fsinfo + FSINFO_TRAIL_OFF, FSINFO_TRAIL_VAL);
         r = __archive_write_output(a, fsinfo, SECTOR_SIZE);
         if (r != ARCHIVE_OK) return r;
 
@@ -1395,7 +1516,11 @@ write_fat_tables(struct archive_write *a)
                 }
             }
             if (c > (msdos->cluster_count + 1)) {
-                DEBUG_PRINT("WARNING: cluster %u is beyond last valid cluster!\n", c);
+                free(fat);
+                archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                    "Cluster %u exceeds valid range (max %u)",
+                    c, msdos->cluster_count + 1);
+                return (ARCHIVE_FATAL);
             }
             if (msdos->fat_type == 12) {
                 fat12_set_entry(fat, c, (uint16_t)nextval);
@@ -1424,7 +1549,7 @@ write_fat_tables(struct archive_write *a)
 /*
  * For FAT12/16, the root dir is in a fixed region of size root_size sectors.
  * We gather all top-level items whose parent==NULL, build the directory entries
- * (including LFN if needed), then zero‐fill the rest.
+ * (including LFN if needed), then zero-fill the rest.
  */
 static int
 write_fat12_16_root_dir(struct archive_write *a)
@@ -1446,16 +1571,18 @@ write_fat12_16_root_dir(struct archive_write *a)
     for (f = msdos->files; f; f = f->next) {
         if (f->parent == NULL && !f->is_root) {
             /* If the long name differs, write LFN. */
-            if (f->long_name && strcmp(f->long_name, f->short_name) != 0) {
-                int lfn_count = (int)((strlen(f->long_name)+12)/13);
-                size_t lfn_bytes = lfn_count * DIR_ENTRY_SIZE;
+            if (f->long_name && strcmp(f->long_name, f->short_name) != 0
+                && f->utf16name != NULL) {
+                int u16chars = (int)(f->utf16name_len / 2);
+                int lfn_count = (u16chars + 12) / 13;
+                size_t lfn_bytes = (size_t)lfn_count * DIR_ENTRY_SIZE;
                 if (offset + lfn_bytes + DIR_ENTRY_SIZE > root_dir_bytes) {
                     free(buf);
                     archive_set_error(&a->archive, ENOSPC, "Root directory overflow");
-                    return ARCHIVE_FATAL;
+                    return (ARCHIVE_FATAL);
                 }
-                /* Write LFN entries. */
-                write_longname_entries(buf + offset, f->long_name, f->short_name);
+                write_longname_entries(buf + offset,
+                    f->utf16name, f->utf16name_len, f->short_name);
                 offset += lfn_bytes;
             }
             /* Then the final 32-byte short entry. */
@@ -1607,24 +1734,42 @@ write_data_clusters(struct archive_write *a)
                         struct fat_file *ch = owner->children;
                         while (ch) {
                             if (ch->long_name &&
-                                strcmp(ch->long_name, ch->short_name) != 0) {
-                                int lfn_count =
-                                    (int)((strlen(ch->long_name) + 12) / 13);
+                                strcmp(ch->long_name, ch->short_name) != 0
+                                && ch->utf16name != NULL) {
+                                int u16c = (int)(ch->utf16name_len / 2);
+                                int lfn_count = (u16c + 12) / 13;
                                 size_t lfn_bytes =
                                     (size_t)lfn_count * DIR_ENTRY_SIZE;
-                                if (off + lfn_bytes + DIR_ENTRY_SIZE <=
+                                if (off + lfn_bytes + DIR_ENTRY_SIZE >
                                     cached_dir_size) {
-                                    write_longname_entries(
-                                        cached_dirbuf + off,
-                                        ch->long_name, ch->short_name);
-                                    off += lfn_bytes;
+                                    free(cached_dirbuf);
+                                    free(tempbuf);
+                                    free(map);
+                                    archive_set_error(&a->archive,
+                                        ARCHIVE_ERRNO_MISC,
+                                        "Subdirectory entries exceed "
+                                        "allocated space");
+                                    return (ARCHIVE_FATAL);
                                 }
+                                write_longname_entries(
+                                    cached_dirbuf + off,
+                                    ch->utf16name, ch->utf16name_len,
+                                    ch->short_name);
+                                off += lfn_bytes;
                             }
-                            if (off + DIR_ENTRY_SIZE <= cached_dir_size) {
-                                write_one_dir_entry(cached_dirbuf + off,
-                                    ch->short_name, ch, msdos->fat_type);
-                                off += DIR_ENTRY_SIZE;
+                            if (off + DIR_ENTRY_SIZE > cached_dir_size) {
+                                free(cached_dirbuf);
+                                free(tempbuf);
+                                free(map);
+                                archive_set_error(&a->archive,
+                                    ARCHIVE_ERRNO_MISC,
+                                    "Subdirectory entries exceed "
+                                    "allocated space");
+                                return (ARCHIVE_FATAL);
                             }
+                            write_one_dir_entry(cached_dirbuf + off,
+                                ch->short_name, ch, msdos->fat_type);
+                            off += DIR_ENTRY_SIZE;
                             ch = ch->sibling;
                         }
                     }
@@ -1650,8 +1795,9 @@ write_data_clusters(struct archive_write *a)
                  */
                 memset(tempbuf, 0, cluster_bytes);
                 size_t to_read = cluster_bytes;
-                /* If it's the last cluster, maybe partial? We'll do the simpler approach: read up to cluster_bytes. 
-                 * If the file was smaller, we zero‐padded in the temp file’s pass #1 anyway. So we can just read cluster_bytes. 
+                /*
+                 * Read up to cluster_bytes.  If the file was smaller,
+                 * we zero-padded in the temp file during pass #1.
                  */
                 if (lseek(msdos->temp_fd, read_off, SEEK_SET) < 0) {
                     free(cached_dirbuf);
@@ -1707,13 +1853,13 @@ write_one_dir_entry(unsigned char *buf, const char shortnm[12],
     /* Attributes. */
     buf[11] = (unsigned char)(f->is_dir ? ATTR_DIRECTORY : ATTR_ARCHIVE);
 
-    /* Timestamps (we can glean from f->entry if needed). For brevity: */
+    /* Timestamps: clamp to 1980-01-01 minimum for DOS date encoding. */
     time_t mtime = 0;
     if (f->entry) {
         mtime = archive_entry_mtime(f->entry);
     }
     struct tm t;
-    if (!localtime_r(&mtime, &t)) {
+    if (!localtime_r(&mtime, &t) || t.tm_year < 80) {
         memset(&t, 0, sizeof(t));
         t.tm_year = 80; /* 1980 */
         t.tm_mon  = 0;
@@ -1741,102 +1887,140 @@ write_one_dir_entry(unsigned char *buf, const char shortnm[12],
     }
 }
 
-/* Write the required LFN entries just before the final short entry. */
+/*
+ * Write the required LFN entries just before the final short entry.
+ * u16name is the filename in UTF-16LE, u16len is its byte length.
+ */
 static void
-write_longname_entries(unsigned char *dirbuf, const char *lname,
-                             const char shortnm[12])
+write_longname_entries(unsigned char *dirbuf, const uint8_t *u16name,
+                       size_t u16len, const char shortnm[12])
 {
-    int name_len = (int)strlen(lname);
-    int entries_needed = (name_len + 12) / 13;
+    int u16chars = (int)(u16len / 2);
+    int entries_needed = (u16chars + 12) / 13;
+    int i, j, chunk_idx, ordinal;
+    unsigned char checksum;
+    int pos;
 
-    // Compute the standard FAT LFN checksum from the short 8.3 name:
-    unsigned char checksum = 0;
-    for (int i = 0; i < 11; i++) {
-        checksum = (unsigned char)((checksum >> 1) + ((checksum & 1) ? 0x80 : 0) + shortnm[i]);
+    /* Compute the standard FAT LFN checksum from the short 8.3 name. */
+    checksum = 0;
+    for (i = 0; i < 11; i++) {
+        checksum = (unsigned char)((checksum >> 1) +
+            ((checksum & 1) ? 0x80 : 0) + shortnm[i]);
     }
-    DEBUG_PRINT("Computed checksum for %.11s: 0x%02x", shortnm, checksum);
 
-    DEBUG_PRINT("\n[LFN DEBUG] Building LFN entries for \"%s\" (length=%d)\n"
-            "            -> total needed: %d\n"
-            "            -> short name: \"%.*s\"\n"
-            "            -> LFN checksum: 0x%02X\n",
-            lname, name_len, entries_needed, 11, shortnm, checksum);
+    /*
+     * Copy in 13-char chunks from front to back of u16name,
+     * but physically place them in descending order in the directory.
+     */
+    pos = 0;
 
-    // We'll copy in 13-char chunks from front to back of lname,
-    // but physically place them in descending order in the directory.
-    int pos = 0;  // index into lname
+    for (chunk_idx = 0; chunk_idx < entries_needed; chunk_idx++) {
+        size_t entry_offset;
+        unsigned char *lfn_ent;
+        int lfn_off;
 
-    for (int chunk_idx = 0; chunk_idx < entries_needed; chunk_idx++) {
-        // ordinal = 1..N in ascending order
-        int ordinal = chunk_idx + 1;
-        // If it's the last chunk, set 0x40
+        ordinal = chunk_idx + 1;
         if (ordinal == entries_needed)
             ordinal |= 0x40;
 
-        // The physical offset in dirbuf:
-        size_t entry_offset = (entries_needed - 1 - chunk_idx) * 32;
-        unsigned char *lfn_ent = dirbuf + entry_offset;
+        entry_offset = (size_t)(entries_needed - 1 - chunk_idx) * 32;
+        lfn_ent = dirbuf + entry_offset;
 
-        // Clear everything first
         memset(lfn_ent, 0, 32);
-
-        // Byte [0] = ordinal
         lfn_ent[0] = (unsigned char)ordinal;
-        // Byte [11] = attributes = 0x0F (LFN)
         lfn_ent[11] = 0x0F;
-        // Byte [13] = LFN checksum
         lfn_ent[13] = checksum;
 
-        DEBUG_PRINT("[LFN DEBUG]  Writing chunk #%d (ordinal=0x%02X) at dirbuf[%zu..%zu]",
-                chunk_idx + 1, (unsigned int)lfn_ent[0], entry_offset, entry_offset + 31);
-
-        // Copy up to 13 characters from lname[pos..pos+12]
-        for (int j = 0; j < 13; j++) {
+        /* Copy up to 13 UTF-16LE code units. */
+        for (j = 0; j < 13; j++) {
             uint16_t ch;
             int namepos = pos + j;
 
-            if (namepos < name_len) {
-                ch = (unsigned char)lname[namepos];
-            } else if (namepos == name_len) {
-                // zero terminator
-                ch = 0;
+            if (namepos < u16chars) {
+                /* Read a UTF-16LE code unit. */
+                ch = (uint16_t)(u16name[namepos * 2]) |
+                     ((uint16_t)(u16name[namepos * 2 + 1]) << 8);
+            } else if (namepos == u16chars) {
+                ch = 0; /* NUL terminator */
             } else {
-                // 0xFFFF for unused
-                ch = 0xFFFF;
+                ch = 0xFFFF; /* Unused slot */
             }
 
-            // In an LFN entry, the 13 UTF-16 chars go to these offsets:
-            //  j=0..4   -> [1..10]
-            //  j=5..10  -> [14..25]
-            //  j=11..12 -> [28..31]
-            int offset;
-            if      (j < 5)  offset = 1 + j*2;       // [1..10]
-            else if (j < 11) offset = 14 + (j-5)*2;  // [14..25]
-            else             offset = 28 + (j-11)*2; // [28..31]
+            /*
+             * LFN entry layout for 13 UTF-16 chars:
+             *   j=0..4   -> bytes [1..10]
+             *   j=5..10  -> bytes [14..25]
+             *   j=11..12 -> bytes [28..31]
+             */
+            if (j < 5)
+                lfn_off = 1 + j * 2;
+            else if (j < 11)
+                lfn_off = 14 + (j - 5) * 2;
+            else
+                lfn_off = 28 + (j - 11) * 2;
 
-            // Store as little-endian UTF-16
-            lfn_ent[offset]   = (unsigned char)(ch & 0xFF);
-            lfn_ent[offset+1] = (unsigned char)(ch >> 8);
+            lfn_ent[lfn_off]     = (unsigned char)(ch & 0xFF);
+            lfn_ent[lfn_off + 1] = (unsigned char)(ch >> 8);
         }
 
-        // We'll print out the actual substring we just copied:
-        int chunk_count = (name_len - pos);
-        if (chunk_count > 13) chunk_count = 13;
-        DEBUG_PRINT("             -> substring: \"%.*s\" (pos=%d..%d)",
-                chunk_count > 0 ? chunk_count : 0,
-                (chunk_count > 0) ? (lname + pos) : "",
-                pos, pos + chunk_count - 1);
-
-        // Advance pos by 13 for next chunk
         pos += 13;
     }
 }
 
 
+/* ---------------- UTF-16LE Name Conversion ---------------- */
+
+/*
+ * Convert a fat_file's long_name to UTF-16LE and store the result
+ * in f->utf16name / f->utf16name_len.  Creates the string converter
+ * lazily on first call.
+ */
+static int
+convert_name_to_utf16(struct archive_write *a, struct msdosfs *msdos,
+                      struct fat_file *f)
+{
+    if (f->long_name == NULL)
+        return (ARCHIVE_OK);
+
+    /* Lazy-init the UTF-16LE converter. */
+    if (msdos->sconv_to_utf16 == NULL) {
+        msdos->sconv_to_utf16 = archive_string_conversion_to_charset(
+            &a->archive, "UTF-16LE", 1);
+        if (msdos->sconv_to_utf16 == NULL)
+            return (ARCHIVE_FATAL);
+    }
+
+    /* Convert long_name to UTF-16LE using a reusable buffer. */
+    msdos->utf16buf.length = 0;
+    if (archive_strncpy_l(&msdos->utf16buf, f->long_name,
+        strlen(f->long_name), msdos->sconv_to_utf16) != 0) {
+        if (errno == ENOMEM) {
+            archive_set_error(&a->archive, ENOMEM,
+                "Cannot allocate memory for UTF-16LE name");
+            return (ARCHIVE_FATAL);
+        }
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+            "Filename cannot be converted to UTF-16LE");
+        return (ARCHIVE_WARN);
+    }
+
+    /* Copy the converted result into the fat_file. */
+    f->utf16name_len = msdos->utf16buf.length;
+    f->utf16name = (uint8_t *)malloc(f->utf16name_len);
+    if (f->utf16name == NULL) {
+        archive_set_error(&a->archive, ENOMEM,
+            "Cannot allocate UTF-16LE name buffer");
+        return (ARCHIVE_FATAL);
+    }
+    memcpy(f->utf16name, msdos->utf16buf.s, f->utf16name_len);
+    return (ARCHIVE_OK);
+}
+
 /* ---------------- Directory-Tree Helpers ---------------- */
 
 static struct fat_file*
-find_or_create_dir(struct msdosfs *msdos, struct fat_file *parent, const char *dirname)
+find_or_create_dir(struct archive_write *a, struct msdosfs *msdos,
+    struct fat_file *parent, const char *dirname)
 {
     /* Look for an existing child dir with that name. */
     struct fat_file *f;
@@ -1853,12 +2037,28 @@ find_or_create_dir(struct msdosfs *msdos, struct fat_file *parent, const char *d
     f->is_dir = 1;
     f->long_name = strdup(dirname);
     f->parent = parent;
+
+    /* Generate a valid 8.3 short name. */
+    make_short_name(f->long_name, f->short_name);
+    if (ensure_unique_short_name(a, msdos, f->short_name, parent) != 0) {
+        free(f->long_name);
+        free(f);
+        return (NULL);
+    }
+
+    /* Convert to UTF-16LE for LFN entries. */
+    if (convert_name_to_utf16(a, msdos, f) != ARCHIVE_OK) {
+        free(f->long_name);
+        free(f);
+        return (NULL);
+    }
+
     /* Insert into global list. */
     f->next = msdos->files;
     msdos->files = f;
     /* Link into parent's child list. */
     add_child_to_parent(parent, f);
-    return f;
+    return (f);
 }
 
 static void
@@ -1908,16 +2108,19 @@ shortname_exists(struct msdosfs *msdos, const char *name, struct fat_file *paren
     return 0;
 }
 
-static void
+static int
 add_shortname(struct msdosfs *msdos, const char *name, struct fat_file *parent_dir)
 {
     unsigned int k = shortname_hash_key(name, parent_dir);
-    struct shortname_entry *e = (struct shortname_entry*)calloc(1,sizeof(*e));
+    struct shortname_entry *e = (struct shortname_entry*)calloc(1, sizeof(*e));
+    if (e == NULL)
+        return (-1);
     memcpy(e->name, name, 11);
     e->name[11] = 0;
     e->parent_dir = parent_dir;
     e->next = msdos->used_shortnames.buckets[k];
     msdos->used_shortnames.buckets[k] = e;
+    return (0);
 }
 
 /* If there's a collision, we try base~N until we find a free name. */
@@ -1963,8 +2166,12 @@ ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos,
                          char short_name[12], struct fat_file *parent_dir)
 {
     if (!shortname_exists(msdos, short_name, parent_dir)) {
-        add_shortname(msdos, short_name, parent_dir);
-        return 0;
+        if (add_shortname(msdos, short_name, parent_dir) != 0) {
+            archive_set_error(&a->archive, ENOMEM,
+                "Cannot allocate short-name entry");
+            return (ARCHIVE_FATAL);
+        }
+        return (0);
     }
     /* There's a collision. We'll try suffix ~1..~999999. */
     char base[9], ext[4];
@@ -1978,17 +2185,21 @@ ensure_unique_short_name(struct archive_write *a, struct msdosfs *msdos,
         if (build_colliding_short_name(base, ext, i, candidate) != 0) {
             archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
                               "Too many short-name collisions");
-            return ARCHIVE_FATAL;
+            return (ARCHIVE_FATAL);
         }
         if (!shortname_exists(msdos, candidate, parent_dir)) {
             memcpy(short_name, candidate, 12);
-            add_shortname(msdos, candidate, parent_dir);
-            return 0;
+            if (add_shortname(msdos, candidate, parent_dir) != 0) {
+                archive_set_error(&a->archive, ENOMEM,
+                    "Cannot allocate short-name entry");
+                return (ARCHIVE_FATAL);
+            }
+            return (0);
         }
     }
     archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
                       "Excessive short-name collisions");
-    return ARCHIVE_FATAL;
+    return (ARCHIVE_FATAL);
 }
 
 /* Generate an 8.3 name from the long name. */

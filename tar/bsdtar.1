@@ -230,6 +230,7 @@ is run in x mode as root.
 Use the specified format for the created archive.
 Supported formats include
 .Dq cpio ,
+.Dq msdosfs ,
 .Dq pax ,
 .Dq shar ,
 and
@@ -598,6 +599,21 @@ and for extract and list modes in
 .Pp
 Examples of supported options:
 .Bl -tag -compact -width indent
+.It Cm msdosfs:fat_type
+Force FAT type: 12, 16, or 32.
+If not specified, the smallest type that can hold the data is chosen
+automatically.
+.It Cm msdosfs:volume_label
+Set the volume label, up to 11 characters.
+Default:
+.Dq NO NAME .
+.It Cm msdosfs:volume_id
+Set the volume serial number as a 32-bit integer.
+Default: derived from current time.
+.It Cm msdosfs:cluster_size
+Override the cluster size in sectors per cluster.
+Must be a power of 2 between 1 and 128.
+Default: automatically chosen.
 .It Cm iso9660:joliet
 Support Joliet extensions.
 This is enabled by default, use
