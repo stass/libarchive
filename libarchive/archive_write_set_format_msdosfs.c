@@ -854,24 +854,24 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
              * If new_fat_size != try_fat_size, we update and loop again.
              */
 
-             /* Start with a guess based on total file size. */
-            uint64_t total_file_bytes = 0;
-            uint64_t total_dir_bytes = 0;
+             /* Count clusters needed per-file (each file/dir gets its
+              * own cluster chain, so a 1-byte file still uses 1 cluster). */
+            uint64_t cbytes = (uint64_t)csize * SECTOR_SIZE;
+            uint64_t needed_clusters_for_files = 0;
+            uint64_t needed_clusters_for_dirs = 0;
             for (struct fat_file *f = msdos->files; f; f = f->next) {
                 if (f->is_dir) {
                     /* FAT12/16 root (is_root) does not consume clusters. */
-                    if (!(f->is_root && (fat_type == 12 || fat_type == 16)))
-                        total_dir_bytes += f->size;
+                    if (!(f->is_root && (fat_type == 12 || fat_type == 16))
+                        && f->size > 0)
+                        needed_clusters_for_dirs +=
+                            (f->size + cbytes - 1) / cbytes;
                 } else {
-                    total_file_bytes += f->size;
+                    if (f->size > 0)
+                        needed_clusters_for_files +=
+                            (f->size + cbytes - 1) / cbytes;
                 }
             }
-
-            /* cluster_size (in bytes) = csize * SECTOR_SIZE */
-            uint64_t cbytes = (uint64_t)csize * SECTOR_SIZE;
-            uint64_t needed_clusters_for_files =
-               (total_file_bytes + cbytes -1)/cbytes;
-            uint64_t needed_clusters_for_dirs = (total_dir_bytes + cbytes - 1) / cbytes;
             uint64_t approx_clusters = needed_clusters_for_files + needed_clusters_for_dirs + 120;
 
             /* Enforce minimum cluster counts per FAT type so that
