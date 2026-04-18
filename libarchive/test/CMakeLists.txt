@@ -159,6 +159,7 @@ IF(ENABLE_TEST)
     test_read_format_lha_filename.c
     test_read_format_lha_filename_utf16.c
     test_read_format_lha_oversize_header.c
+    test_read_format_msdosfs.c
     test_read_format_mtree.c
     test_read_format_mtree_crash747.c
     test_read_format_pax_bz2.c

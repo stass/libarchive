@@ -195,6 +195,7 @@ libarchive_la_SOURCES= \
 	libarchive/archive_read_support_format_cpio.c \
 	libarchive/archive_read_support_format_empty.c \
 	libarchive/archive_read_support_format_iso9660.c \
+	libarchive/archive_read_support_format_msdosfs.c \
 	libarchive/archive_read_support_format_lha.c \
 	libarchive/archive_read_support_format_mtree.c \
 	libarchive/archive_read_support_format_rar.c \
@@ -521,6 +522,7 @@ libarchive_test_SOURCES= \
 	libarchive/test/test_read_format_lha_filename.c \
 	libarchive/test/test_read_format_lha_filename_utf16.c \
 	libarchive/test/test_read_format_lha_oversize_header.c \
+	libarchive/test/test_read_format_msdosfs.c \
 	libarchive/test/test_read_format_mtree.c \
 	libarchive/test/test_read_format_mtree_crash747.c \
 	libarchive/test/test_read_format_pax_bz2.c \
