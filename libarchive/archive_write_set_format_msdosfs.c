@@ -975,6 +975,8 @@ try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_si
     } /* end for j=0..n_candidates */
 
     /* If we get here => we couldn’t converge for that fat_type, fail. */
+    archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+        "Data too large for FAT%d filesystem", fat_type);
     return ARCHIVE_FATAL;
 }
 
