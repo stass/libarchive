@@ -771,14 +771,14 @@ msdosfs_compute_geometry(struct archive_write *a)
     return ARCHIVE_FATAL;
 }
 
-/* ----------------------------------------------------------------------
+/*
  * try_fat_geometry() => for a given fat_type = (12|16|32), tries 
  * cluster_size = 1,2,4,8,16,... up to some max, and attempts to converge 
  * on a stable geometry that fits all files & directories. 
  * 
  * If successful, sets msdos->... fields and returns ARCHIVE_OK. 
  * If not, returns ARCHIVE_FATAL, leaving geometry untouched.
- * ---------------------------------------------------------------------- */
+ */
 static int
 try_fat_geometry(struct archive_write *a, int fat_type, uint32_t *out_cluster_size)
 {
