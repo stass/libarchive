@@ -385,6 +385,7 @@ typedef const char *archive_passphrase_callback(struct archive *,
 #define	ARCHIVE_FORMAT_7ZIP			0xE0000
 #define	ARCHIVE_FORMAT_WARC			0xF0000
 #define	ARCHIVE_FORMAT_RAR_V5			0x100000
+#define	ARCHIVE_FORMAT_MSDOSFS			0x110000
 
 /*
  * Codes returned by archive_read_format_capabilities().
@@ -495,6 +496,7 @@ __LA_DECL int archive_read_support_format_empty(struct archive *);
 __LA_DECL int archive_read_support_format_gnutar(struct archive *);
 __LA_DECL int archive_read_support_format_iso9660(struct archive *);
 __LA_DECL int archive_read_support_format_lha(struct archive *);
+__LA_DECL int archive_read_support_format_msdosfs(struct archive *);
 __LA_DECL int archive_read_support_format_mtree(struct archive *);
 __LA_DECL int archive_read_support_format_rar(struct archive *);
 __LA_DECL int archive_read_support_format_rar5(struct archive *);
@@ -854,6 +856,7 @@ __LA_DECL int archive_write_set_format_cpio_odc(struct archive *);
 __LA_DECL int archive_write_set_format_cpio_pwb(struct archive *);
 __LA_DECL int archive_write_set_format_gnutar(struct archive *);
 __LA_DECL int archive_write_set_format_iso9660(struct archive *);
+__LA_DECL int archive_write_set_format_msdosfs(struct archive *);
 __LA_DECL int archive_write_set_format_mtree(struct archive *);
 __LA_DECL int archive_write_set_format_mtree_classic(struct archive *);
 /* TODO: int archive_write_set_format_old_tar(struct archive *); */

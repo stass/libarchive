@@ -66,6 +66,9 @@ archive_read_set_format(struct archive *_a, int code)
     case ARCHIVE_FORMAT_ISO9660:
       str = "iso9660";
       break;
+    case ARCHIVE_FORMAT_MSDOSFS:
+      strcpy(str, "msdosfs");
+      break;
     case ARCHIVE_FORMAT_LHA:
       str = "lha";
       break;

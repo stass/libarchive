@@ -10,10 +10,8 @@
  *   6) Actually writes the final disk image into the archive (not empty).
  *
  * NOTE:
- *   - We now implement multi-level subdirectories by splitting the entire path
- *     into components and creating them recursively.
- *   - We do not assign volume labels or handle advanced geometry.
- *   - Adjust or further test as needed!
+ *   - Uses multi-level subdirectories by splitting the path and recursively creating them.
+ *   - This patch also fixes deeper subdirectories not being written (missing files).
  */
 
 #include "archive_platform.h"
@@ -78,9 +76,9 @@ struct fat_file {
     int is_root;               /* For FAT12/16 fixed root or FAT32 cluster #2 root */
     off_t content_offset;      /* Where the file’s data is buffered in temp_fd */
 
-    struct fat_file *parent;        /* The directory that contains us, NULL if root-level. */
-    struct fat_file *children;      /* Not heavily used in this approach, but can be expanded. */
-    struct fat_file *sibling;       /* Also not heavily used here. */
+    struct fat_file *parent;   /* The directory that contains us, NULL if root-level. */
+    struct fat_file *children; /* Not heavily used here, but can be expanded. */
+    struct fat_file *sibling;
 };
 
 /* For tracking used short names to ensure uniqueness. */
@@ -91,17 +89,17 @@ struct shortname_list {
 
 /* Our main writer state. */
 struct msdosfs {
-    int fat_type;           /* 12, 16, or 32 */
-    uint32_t volume_size;   /* total # of sectors in the volume */
-    uint32_t cluster_size;  /* sectors per cluster */
+    int fat_type;           
+    uint32_t volume_size;   
+    uint32_t cluster_size;  
     uint32_t reserved_sectors;
-    uint32_t fat_size;      /* size (in sectors) of one FAT */
-    uint32_t root_entries;  /* # of root dir entries (FAT12/16) */
-    uint32_t root_size;     /* # of sectors for root dir (FAT12/16) */
-    uint32_t cluster_count; /* total # data clusters (for FAT) */
-    uint32_t fat_offset;    /* sector offset to first FAT */
-    uint32_t root_offset;   /* sector offset to root dir (FAT12/16) */
-    uint32_t data_offset;   /* sector offset to data area */
+    uint32_t fat_size;      
+    uint32_t root_entries;  
+    uint32_t root_size;     
+    uint32_t cluster_count; 
+    uint32_t fat_offset;    
+    uint32_t root_offset;   
+    uint32_t data_offset;   
 
     struct fat_file *files;
     struct fat_file *current_file;
@@ -180,6 +178,11 @@ static void set_fat12_entry(unsigned char *fat, uint32_t cluster, uint16_t value
 static int write_boot_sector(struct archive_write *a);
 static int write_fats(struct archive_write *a);
 static int write_root_dir(struct archive_write *a);
+
+/// FIX START: Added a helper to recursively write subdirectories.
+static int write_subdirectories_recursively(struct archive_write *a, struct fat_file *parent);
+/// FIX END
+
 static int write_directory(struct archive_write *a, struct fat_file *dir,
                            struct fat_file **dir_entries, int num_entries);
 static int write_cluster_chain(struct archive_write *a, struct fat_file *file);
@@ -189,7 +192,6 @@ static int  write_dir_entry(unsigned char *buffer, const char *name, struct fat_
 static int  write_long_name_entries(unsigned char *buffer, const char *long_name, const char *short_name);
 static int  count_dir_entries_for_file(struct fat_file *f);
 
-/* -- CHANGED to accept a parent argument so subdirs can be nested properly. */
 static struct fat_file* find_or_create_dir(struct msdosfs *msdos,
                                            struct fat_file *parent,
                                            const char *dirname);
@@ -287,14 +289,12 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
     file->size  = (uint32_t)archive_entry_size(entry);
     file->is_dir = (archive_entry_filetype(entry) == AE_IFDIR);
 
-    /// FIX START: Replace the old single-slash logic with multi-level creation.
     {
         const char *pathname = archive_entry_pathname(entry);
         if (!pathname)
             pathname = "";
 
-        /* Split the entire path on '/' into components.
-         * We'll create/find each directory in turn. */
+        /* Split the entire path on '/' into components. */
         char *pathdup = strdup(pathname);
         if (!pathdup) {
             archive_set_error(&a->archive, ENOMEM, "strdup failed");
@@ -309,7 +309,7 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
         while (token) {
             char *next = strtok_r(NULL, "/", &brkt);
             if (next) {
-                /* This is an intermediate directory name.  Create/find it. */
+                /* Intermediate directory name. */
                 parent_dir = find_or_create_dir(msdos, parent_dir, token);
             } else {
                 /* Last component => file or final dir name. */
@@ -317,19 +317,16 @@ archive_write_msdosfs_header(struct archive_write *a, struct archive_entry *entr
             }
             token = next;
         }
-
         if (last_component) {
             file->long_name = strdup(last_component);
-            file->parent = parent_dir; /* final file or dir is child of parent_dir */
+            file->parent = parent_dir;
         } else {
-            /* Means the path had trailing slash or was empty => root or single dir? */
+            /* Means empty or all slash => treat as the single name in root? */
             file->long_name = strdup(pathdup);
-            /* If entire path was slashless single name, parent_dir == NULL, so it ends up in root. */
             file->parent = parent_dir;
         }
         free(pathdup);
     }
-    /// FIX END
 
     file->next = msdos->files;
     msdos->files = file;
@@ -381,13 +378,22 @@ archive_write_msdosfs_finish_entry(struct archive_write *a)
     return (ARCHIVE_OK);
 }
 
+/*
+ * The big close:
+ *  1) Possibly adjust geometry for FAT12/16 if we need more root dir entries
+ *  2) For FAT32, create a root_dir entry if needed
+ *  3) Write boot sector
+ *  4) Write FATs
+ *  5) Write root directory + subdirectories
+ *  6) Write each file's cluster data
+ *  7) Copy entire disk image to final archive
+ */
 static int
 archive_write_msdosfs_close(struct archive_write *a)
 {
     struct msdosfs *msdos = (struct msdosfs *)a->format_data;
     int r;
 
-    /* If FAT12/16, ensure root_entries is large enough. */
     if (msdos->fat_type == 12 || msdos->fat_type == 16) {
         int needed_entries = 0;
         struct fat_file *f;
@@ -405,7 +411,6 @@ archive_write_msdosfs_close(struct archive_write *a)
         }
     }
 
-    /* For FAT32, create a “root_dir” entry if not present. */
     if (msdos->fat_type == 32) {
         struct fat_file *root_dir = NULL;
         {
@@ -438,19 +443,19 @@ archive_write_msdosfs_close(struct archive_write *a)
         root_dir->size = (uint32_t)dir_bytes_needed;
     }
 
-    /* 1) Write boot sector. */
+    /* 1) Boot sector. */
     r = write_boot_sector(a);     
     if (r != ARCHIVE_OK) return r;
 
-    /* 2) Write FATs. */
+    /* 2) FATs. */
     r = write_fats(a);           
     if (r != ARCHIVE_OK) return r;
 
-    /* 3) Write root directory. */
+    /* 3) Root directory (and subdirs). */
     r = write_root_dir(a);       
     if (r != ARCHIVE_OK) return r;
 
-    /* 4) Write each file’s actual data clusters. */
+    /* 4) Write file data. */
     {
         struct fat_file *f;
         for (f = msdos->files; f; f = f->next) {
@@ -459,7 +464,7 @@ archive_write_msdosfs_close(struct archive_write *a)
         }
     }
 
-    /* 5) Copy entire disk image from temp_fd to final archive. */
+    /* 5) Copy entire disk image out. */
     {
         unsigned char *buf = msdos->write_buffer;
         size_t disk_size = (size_t)msdos->volume_size * SECTOR_SIZE;
@@ -478,6 +483,7 @@ archive_write_msdosfs_close(struct archive_write *a)
                 return (ARCHIVE_FATAL);
             }
             if (rd == 0) {
+                /* If short read, pad with zeros. */
                 memset(buf, 0, to_read);
                 rd = (ssize_t)to_read;
             }
@@ -969,7 +975,7 @@ write_root_dir(struct archive_write *a)
         if (!root_dir) {
             return ARCHIVE_OK; 
         }
-        /* Build a list of top-level entries for root_dir. */
+        /* Gather top-level items for root_dir. */
         int num_entries=0;
         {
             int estimate=2;
@@ -1002,50 +1008,13 @@ write_root_dir(struct archive_write *a)
                 if (r!=ARCHIVE_OK) return r;
             }
         }
-        /* Then recursively write subdirectories under root */
+        /// FIX START: Recursively write subdirectories from root_dir downward.
         {
-            struct fat_file *f;
-            for (f = msdos->files; f; f=f->next) {
-                if (f->is_dir && f->parent==root_dir) {
-                    /* gather children for this subdir. */
-                    int child_count=2; 
-                    struct fat_file *c;
-                    for (c = msdos->files; c; c=c->next) {
-                        if (c->parent==f) child_count += count_dir_entries_for_file(c);
-                    }
-                    if (child_count>2) {
-                        struct fat_file **sublist = calloc((size_t)child_count, sizeof(*sublist));
-                        if (!sublist) {
-                            archive_set_error(&a->archive, ENOMEM, "No mem for subdir list");
-                            return (ARCHIVE_FATAL);
-                        }
-                        int idx=0;
-                        sublist[idx++] = f; 
-                        sublist[idx++] = NULL; 
-                        for (c = msdos->files; c; c=c->next) {
-                            if (c->parent==f) {
-                                sublist[idx++] = c;
-                            }
-                        }
-                        {
-                            int rr = write_directory(a, f, sublist, idx);
-                            free(sublist);
-                            if (rr!=ARCHIVE_OK) return rr;
-                        }
-                    } else {
-                        /* empty dir */
-                        struct fat_file **dummy = calloc(2, sizeof(*dummy));
-                        dummy[0] = f;
-                        dummy[1] = NULL;
-                        {
-                            int rr = write_directory(a, f, dummy, 2);
-                            free(dummy);
-                            if (rr!=ARCHIVE_OK) return rr;
-                        }
-                    }
-                }
-            }
+            int r2 = write_subdirectories_recursively(a, root_dir);
+            if (r2 != ARCHIVE_OK)
+                return r2;
         }
+        /// FIX END
         return ARCHIVE_OK;
     } else {
         /* FAT12/16 => fixed root region. */
@@ -1059,6 +1028,7 @@ write_root_dir(struct archive_write *a)
 
         struct fat_file *f;
         for (f=msdos->files; f; f=f->next) {
+            /* Only top-level items (parent==NULL or is_root). */
             if (!f->is_root && f->parent != NULL) {
                 continue;
             }
@@ -1092,39 +1062,71 @@ write_root_dir(struct archive_write *a)
         }
         free(buf);
 
-        /* Write subdirectories in data area, if any. */
+        /// FIX START: Also do a recursive subdirectory write for top-level subdirs.
         {
-            struct fat_file *dir;
-            for (dir=msdos->files; dir; dir=dir->next) {
-                if (dir->is_dir && !dir->is_root && !dir->parent) {
-                    int num_entries=2; 
-                    struct fat_file *c;
-                    for (c=msdos->files; c; c=c->next) {
-                        if (c->parent==dir) num_entries += count_dir_entries_for_file(c);
-                    }
-                    struct fat_file **arr = calloc((size_t)num_entries, sizeof(*arr));
-                    if (!arr) {
-                        archive_set_error(&a->archive, ENOMEM, "No mem for subdir list");
-                        return (ARCHIVE_FATAL);
-                    }
-                    int idx=0;
-                    arr[idx++] = dir; 
-                    arr[idx++] = NULL; 
-                    for (c=msdos->files; c; c=c->next) {
-                        if (c->parent==dir) arr[idx++] = c;
-                    }
-                    {
-                        int rr = write_directory(a, dir, arr, idx);
-                        free(arr);
-                        if (rr!=ARCHIVE_OK) return rr;
-                    }
-                }
-            }
+            int r2 = write_subdirectories_recursively(a, NULL);
+            if (r2 != ARCHIVE_OK)
+                return r2;
         }
+        /// FIX END
 
-        return ARCHIVE_OK;
+        return (ARCHIVE_OK);
     }
 }
+
+/// FIX START: New helper function to recursively write subdirectories under `parent`.
+static int
+write_subdirectories_recursively(struct archive_write *a, struct fat_file *parent)
+{
+    struct msdosfs *msdos = (struct msdosfs *)a->format_data;
+    int r;
+
+    /* Find all directories that have parent == `parent` (excluding root if parent=NULL?). */
+    struct fat_file *dir;
+    for (dir = msdos->files; dir; dir=dir->next) {
+        /* Must be a directory that is not the FAT32 root if parent==NULL in FAT12/16 mode, etc. */
+        if (!dir->is_dir || dir->is_root)
+            continue;
+        if (dir->parent == parent) {
+            /*
+             * Gather all children of 'dir', build a small array, then write_directory().
+             */
+            int num_entries = 2; /* "." + ".." */
+            struct fat_file *c;
+            for (c = msdos->files; c; c=c->next) {
+                if (c->parent == dir) {
+                    num_entries += count_dir_entries_for_file(c);
+                }
+            }
+            struct fat_file **sublist = calloc((size_t)num_entries, sizeof(*sublist));
+            if (!sublist) {
+                archive_set_error(&a->archive, ENOMEM, "No mem for subdir list");
+                return (ARCHIVE_FATAL);
+            }
+            int idx=0;
+            sublist[idx++] = dir;
+            sublist[idx++] = NULL;
+            for (c = msdos->files; c; c=c->next) {
+                if (c->parent == dir) {
+                    sublist[idx++] = c;
+                }
+            }
+            r = write_directory(a, dir, sublist, num_entries);
+            free(sublist);
+            if (r != ARCHIVE_OK)
+                return r;
+
+            /*
+             * Now recursively write subdirectories under `dir` as well.
+             */
+            r = write_subdirectories_recursively(a, dir);
+            if (r != ARCHIVE_OK)
+                return r;
+        }
+    }
+    return ARCHIVE_OK;
+}
+/// FIX END
 
 static int
 write_directory(struct archive_write *a, struct fat_file *dir,
@@ -1448,8 +1450,6 @@ count_dir_entries_for_file(struct fat_file *f)
     }
 }
 
-/* ------------------- FIXED: find_or_create_dir() with parent param ------------------- */
-
 static struct fat_file*
 find_or_create_dir(struct msdosfs *msdos, struct fat_file *parent, const char *dirname)
 {
@@ -1457,7 +1457,6 @@ find_or_create_dir(struct msdosfs *msdos, struct fat_file *parent, const char *d
     for (f = msdos->files; f; f=f->next) {
         if (f->is_dir && f->long_name && strcmp(f->long_name, dirname)==0) {
             if (f->parent == parent) {
-                /* Found the matching directory with same parent. */
                 return f;
             }
         }

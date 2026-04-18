@@ -144,6 +144,7 @@ archive_entry_linkresolver_set_strategy(struct archive_entry_linkresolver *res,
 		res->strategy = ARCHIVE_ENTRY_LINKIFY_LIKE_MTREE;
 		break;
 	case ARCHIVE_FORMAT_ISO9660:
+	case ARCHIVE_FORMAT_MSDOSFS:
 	case ARCHIVE_FORMAT_SHAR:
 	case ARCHIVE_FORMAT_TAR:
 	case ARCHIVE_FORMAT_XAR:
