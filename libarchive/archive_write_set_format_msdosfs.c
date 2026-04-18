@@ -1988,8 +1988,11 @@ convert_name_to_utf16(struct archive_write *a, struct msdosfs *msdos,
     if (msdos->sconv_to_utf16 == NULL) {
         msdos->sconv_to_utf16 = archive_string_conversion_to_charset(
             &a->archive, "UTF-16LE", 1);
-        if (msdos->sconv_to_utf16 == NULL)
+        if (msdos->sconv_to_utf16 == NULL) {
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                "Failed to create UTF-16LE converter");
             return (ARCHIVE_FATAL);
+        }
     }
 
     /* Convert long_name to UTF-16LE using a reusable buffer. */
